@@ -6,6 +6,8 @@ const TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 if (!TOKEN) { console.error('HUBSPOT_PRIVATE_APP_TOKEN required'); process.exit(1); }
 
 const PORT = process.env.PORT || 3000;
+const INSTANTLY_KEY = process.env.INSTANTLY_API_KEY;
+const INSTANTLY_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36';
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CHANNELS = [
   { key: 'cold_call',           label: 'Cold Call',           cost: 4100 },
@@ -70,10 +72,62 @@ async function fetchEngagementsByContact(objectType) {
   return byContact;
 }
 
+// Instantly campaign data for the cold-email report. Two calls:
+// analytics (denominators) + one batched lead lookup for cold-email paid
+// customers (primary + secondary emails; leads can sit under either).
+// Returns null when the key is missing or Instantly is unreachable, and the
+// campaign section renders a notice instead of numbers.
+async function fetchInstantly(paidCustomers) {
+  if (!INSTANTLY_KEY) return null;
+  const headers = { Authorization: `Bearer ${INSTANTLY_KEY}`, 'User-Agent': INSTANTLY_UA, 'Content-Type': 'application/json' };
+  try {
+    const { data: analytics } = await axios.get('https://api.instantly.ai/api/v2/campaigns/analytics', { headers, timeout: 20000 });
+    const knownNames = new Set((analytics || []).map(a => a.campaign_name));
+    const ceEmails = [];
+    for (const c of paidCustomers) {
+      const origin = c.properties.person_original_channel || c.properties.original_source_channel;
+      if (origin !== 'cold_email') continue;
+      if (knownNames.has(c.properties.sammy_utm_campaign)) continue; // stamped, no lookup needed
+      const emails = [];
+      if (c.properties.email) emails.push(c.properties.email.toLowerCase());
+      for (const alt of (c.properties.hs_additional_emails || '').split(';')) {
+        if (alt.trim()) emails.push(alt.trim().toLowerCase());
+      }
+      if (emails.length) ceEmails.push(emails);
+    }
+    // Batched lookup first (cheap), then per-customer retries: the contacts
+    // filter drops matches nondeterministically at batch size, while
+    // single-contact calls are stable. Without the retry pass, campaign
+    // credit can wobble between refreshes.
+    const leadCampaign = {};
+    const flat = ceEmails.flat();
+    for (let i = 0; i < flat.length; i += 90) {
+      const { data } = await axios.post('https://api.instantly.ai/api/v2/leads/list',
+        { contacts: flat.slice(i, i + 90), limit: 100 }, { headers, timeout: 20000 });
+      for (const lead of data.items || []) {
+        if (lead.email && lead.campaign) leadCampaign[lead.email.toLowerCase()] = lead.campaign;
+      }
+    }
+    for (const custEmails of ceEmails) {
+      if (custEmails.some(e => leadCampaign[e])) continue;
+      const { data } = await axios.post('https://api.instantly.ai/api/v2/leads/list',
+        { contacts: custEmails, limit: 10 }, { headers, timeout: 20000 });
+      for (const lead of data.items || []) {
+        if (lead.email && lead.campaign) leadCampaign[lead.email.toLowerCase()] = lead.campaign;
+      }
+      await sleep(150);
+    }
+    return { analytics, leadCampaign };
+  } catch (err) {
+    console.error('[instantly] fetch failed:', err.response?.status || err.message);
+    return null;
+  }
+}
+
 async function fetchData() {
   const paidCustomers = await searchContacts(
     [{ propertyName: 'user_status', operator: 'EQ', value: 'paid_customer' }],
-    ['email', 'original_source_channel', 'person_original_channel', 'sammy_pricing_plan', 'sammy_promo_code', 'sammy_subscription_tier'],
+    ['email', 'original_source_channel', 'person_original_channel', 'sammy_pricing_plan', 'sammy_promo_code', 'sammy_subscription_tier', 'sammy_utm_campaign', 'hs_additional_emails'],
   );
 
   const thirtyDaysAgoMs = Date.now() - 30 * 86400000;
@@ -88,7 +142,9 @@ async function fetchData() {
     fetchEngagementsByContact('meetings'),
   ]);
 
-  return { paidCustomers, recent, callsByContact, meetingsByContact, fetchedAt: new Date().toISOString() };
+  const instantly = await fetchInstantly(paidCustomers);
+
+  return { paidCustomers, recent, callsByContact, meetingsByContact, instantly, fetchedAt: new Date().toISOString() };
 }
 
 // Closing-channel attribution: which channel actually closed the deal?
@@ -108,7 +164,7 @@ function customerMRR(c) {
   return price;
 }
 
-function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact }) {
+function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, instantly }) {
   const init = {};
   const acq = {};
   for (const c of CHANNELS) {
@@ -117,6 +173,8 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact })
   }
   init['_unknown'] = { customers: 0, mrr: 0, new30d: 0, totalTouches: 0, originMix: {} };
   acq['_unknown'] = { customers: 0, mrr: 0, new30d: 0 };
+  const crosstab = {};
+  const campaignPaid = {};
 
   for (const c of paidCustomers) {
     const price = customerMRR(c);
@@ -133,6 +191,30 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact })
     const bucket = init[closing] || init['_unknown'];
     bucket.customers += 1;
     bucket.mrr += price;
+
+    // Origination x closing crosstab
+    crosstab[origin0] = crosstab[origin0] || {};
+    crosstab[origin0][closing] = (crosstab[origin0][closing] || 0) + 1;
+
+    // Cold-email campaign credit: HubSpot stamp first (written at creation
+    // once the sammy-dashboard webhook update ships), live Instantly lead
+    // match second, explicit "other" bucket for everything unverifiable.
+    if (origin0 === 'cold_email') {
+      let campKey = null;
+      const stamp = c.properties.sammy_utm_campaign;
+      if (stamp && instantly && (instantly.analytics || []).some(a => a.campaign_name === stamp)) campKey = 'name:' + stamp;
+      if (!campKey && instantly) {
+        const emails = [c.properties.email, ...(c.properties.hs_additional_emails || '').split(';')]
+          .map(e => (e || '').trim().toLowerCase()).filter(Boolean);
+        for (const e of emails) {
+          if (instantly.leadCampaign[e]) { campKey = 'id:' + instantly.leadCampaign[e]; break; }
+        }
+      }
+      const ck = campKey || 'other';
+      campaignPaid[ck] = campaignPaid[ck] || { customers: 0, mrr: 0 };
+      campaignPaid[ck].customers += 1;
+      campaignPaid[ck].mrr += price;
+    }
 
     const calls = callsByContact[c.id] || 0;
     const meetings = meetingsByContact[c.id] || 0;
@@ -185,7 +267,33 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact })
 
   const unknown = init['_unknown'];
 
-  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown };
+  // Campaign report rows: Instantly analytics denominators + verified paid credit.
+  let campaignRows = null;
+  let campaignOther = null;
+  if (instantly) {
+    campaignRows = (instantly.analytics || [])
+      .filter(a => !(a.campaign_name || '').toLowerCase().startsWith('charm'))
+      .map(a => {
+        const byId = campaignPaid['id:' + a.campaign_id] || { customers: 0, mrr: 0 };
+        const byName = campaignPaid['name:' + a.campaign_name] || { customers: 0, mrr: 0 };
+        const paid = { customers: byId.customers + byName.customers, mrr: byId.mrr + byName.mrr };
+        return {
+          name: a.campaign_name, status: a.campaign_status,
+          contacted: a.contacted_count || 0, replies: a.reply_count || 0,
+          interested: a.total_opportunities || 0,
+          customers: paid.customers, mrr: paid.mrr,
+        };
+      })
+      .sort((a, b) => b.mrr - a.mrr || b.contacted - a.contacted);
+    const creditedKeys = new Set();
+    for (const a of instantly.analytics || []) { creditedKeys.add('id:' + a.campaign_id); creditedKeys.add('name:' + a.campaign_name); }
+    campaignOther = { customers: 0, mrr: 0 };
+    for (const [k, v] of Object.entries(campaignPaid)) {
+      if (k === 'other' || !creditedKeys.has(k)) { campaignOther.customers += v.customers; campaignOther.mrr += v.mrr; }
+    }
+  }
+
+  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther };
 }
 
 let cache = { data: null, time: 0, error: null, loading: null };
@@ -228,7 +336,7 @@ function renderHTML(data, error) {
       <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fafafa;color:#333}</style>
       </head><body><div><p>Loading data from HubSpot…</p>${error ? `<p style="color:#b00">Error: ${error}</p>` : ''}<script>setTimeout(()=>location.reload(),3000)</script></div></body></html>`;
   }
-  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, fetchedAt } = data;
+  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, fetchedAt } = data;
   const fmtOriginMix = (mix) => {
     const entries = Object.entries(mix).sort((a, b) => b[1] - a[1]);
     if (entries.length === 0) return '<span class="muted">-</span>';
@@ -255,6 +363,87 @@ function renderHTML(data, error) {
       <td class="num">${r.cost > 0 ? fmtMoney(r.cost) : '<span class="muted">n/a</span>'}</td>
       <td class="num">${fmtROI(r.roi)}</td>
     </tr>`).join('');
+
+  // Cold email by campaign
+  const STATUS_LABEL = { 0: 'Draft', 1: 'Active', 2: 'Paused', 3: 'Ended', 4: 'Ended' };
+  let campaignSection = '';
+  if (campaignRows) {
+    const totalCamp = campaignRows.reduce((t, r) => ({
+      contacted: t.contacted + r.contacted, replies: t.replies + r.replies,
+      interested: t.interested + r.interested, customers: t.customers + r.customers, mrr: t.mrr + r.mrr,
+    }), { contacted: 0, replies: 0, interested: 0, customers: campaignOther.customers, mrr: campaignOther.mrr });
+    const campHtml = campaignRows.map(r => `
+    <tr class="${r.customers === 0 && r.status !== 1 ? 'dim' : ''}">
+      <td class="label">${r.name} ${r.status === 1 ? '<span class="mix-tag">Active</span>' : `<span class="muted" style="font-size:11px">${STATUS_LABEL[r.status] || ''}</span>`}</td>
+      <td class="num">${r.contacted.toLocaleString()}</td>
+      <td class="num">${r.replies}</td>
+      <td class="num">${r.interested}</td>
+      <td class="num">${r.customers || '<span class="muted">0</span>'}</td>
+      <td class="num">${r.mrr ? fmtMoney(r.mrr) : '<span class="muted">-</span>'}</td>
+    </tr>`).join('');
+    campaignSection = `
+  <h2 class="section-title">Cold email by campaign</h2>
+  <p class="section-sub">Instantly campaign performance joined to verified paying customers. A customer is credited to a campaign only when the campaign stamp or a live Instantly lead match confirms it; everything unverifiable stays in the last row rather than being guessed.</p>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Campaign</th><th>Contacted</th><th>Replies</th><th>Interested</th><th>Paying Customers</th><th>MRR</th></tr>
+      </thead>
+      <tbody>${campHtml}
+    <tr>
+      <td class="label muted">Other cold email (Clay, EmailBison era, removed Instantly leads)</td>
+      <td class="num"><span class="muted">n/a</span></td>
+      <td class="num"><span class="muted">n/a</span></td>
+      <td class="num"><span class="muted">n/a</span></td>
+      <td class="num">${campaignOther.customers}</td>
+      <td class="num">${fmtMoney(campaignOther.mrr)}</td>
+    </tr></tbody>
+      <tfoot>
+        <tr>
+          <td>Total cold email</td>
+          <td class="num">${totalCamp.contacted.toLocaleString()}</td>
+          <td class="num">${totalCamp.replies}</td>
+          <td class="num">${totalCamp.interested}</td>
+          <td class="num">${totalCamp.customers}</td>
+          <td class="num">${fmtMoney(totalCamp.mrr)}</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>`;
+  } else {
+    campaignSection = `
+  <h2 class="section-title">Cold email by campaign</h2>
+  <p class="section-sub">Instantly data unavailable (missing INSTANTLY_API_KEY or Instantly unreachable). No numbers are shown rather than stale or partial ones.</p>`;
+  }
+
+  // Origination x closing crosstab
+  const closingKeys = CHANNELS.filter(c => rows.some(r => r.key === c.key && r.customers > 0)).map(c => c.key);
+  const originKeys = CHANNELS.filter(c => (crosstab[c.key] && Object.keys(crosstab[c.key]).length)).map(c => c.key);
+  const chLabel = k => (CHANNELS.find(c => c.key === k) || { label: k }).label;
+  const xtabHtml = originKeys.map(o => {
+    const rowTotal = Object.values(crosstab[o]).reduce((a, b) => a + b, 0);
+    return `
+    <tr>
+      <td class="label">${chLabel(o)}</td>
+      ${closingKeys.map(k => `<td class="num">${crosstab[o][k] || '<span class="muted">0</span>'}</td>`).join('')}
+      <td class="num"><strong>${rowTotal}</strong></td>
+    </tr>`;
+  }).join('');
+  const xtabColTotals = closingKeys.map(k => originKeys.reduce((t, o) => t + (crosstab[o][k] || 0), 0));
+  const crosstabSection = `
+  <h2 class="section-title">Origination x closing</h2>
+  <p class="section-sub">Rows are where customers came from, columns are how they were closed. Read a row to see how much of a channel's pipeline the sales team converts versus self-serve.</p>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Originated → Closed by</th>${closingKeys.map(k => `<th>${chLabel(k)}</th>`).join('')}<th>Total</th></tr>
+      </thead>
+      <tbody>${xtabHtml}</tbody>
+      <tfoot>
+        <tr><td>Total</td>${xtabColTotals.map(t => `<td class="num">${t}</td>`).join('')}<td class="num">${xtabColTotals.reduce((a, b) => a + b, 0)}</td></tr>
+      </tfoot>
+    </table>
+  </div>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -358,6 +547,8 @@ function renderHTML(data, error) {
       </tfoot>
     </table>
   </div>
+  ${campaignSection}
+  ${crosstabSection}
   ${unknown.customers > 0 || unknown.new30d > 0 ? `<div class="unknown-warning"><strong>${unknown.customers}</strong> paying customer(s) and <strong>${unknown.new30d}</strong> recent contact(s) have no <code>original_source_channel</code> set yet. The hourly classifier will pick them up on its next run.</div>` : ''}
   <p class="footnote">
     <strong>Acquisition</strong> reads <code>person_original_channel</code> (person level, set by the governed classifier) with <code>original_source_channel</code> as fallback. MRR uses <code>sammy_pricing_plan</code> minus the $10 promo discount where <code>sammy_promo_code</code> is set.
@@ -365,6 +556,7 @@ function renderHTML(data, error) {
     <strong>Closing Channel</strong> = where the deal was actually closed. Rule: 2+ calls or 1+ meeting on a paid customer means sales-led close (cold_call); otherwise the original lead source wins.
     <strong>Avg Touches</strong> = average calls + meetings per paid customer in that bucket.
     <strong>Originated From</strong> = of the customers closed here, where they originally entered HubSpot (Email = cold email, Organic = inbound form, UGC = manual/user-generated).
+    <strong>Cold email by campaign</strong>: denominators from Instantly analytics; paying customers matched by campaign stamp or live lead lookup (primary and secondary emails). Customers acquired before Instantly or whose leads were removed cannot be re-matched and stay in the "Other" row; campaign stamping at contact creation (sammy-dashboard webhook update) grows verified coverage over time.
     Source: HubSpot, cached 5 min. <a class="refresh" href="/?force=1">Force refresh</a>.
   </p>
 </div>
