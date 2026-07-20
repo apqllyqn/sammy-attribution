@@ -73,7 +73,7 @@ async function fetchEngagementsByContact(objectType) {
 async function fetchData() {
   const paidCustomers = await searchContacts(
     [{ propertyName: 'user_status', operator: 'EQ', value: 'paid_customer' }],
-    ['email', 'original_source_channel', 'sammy_pricing_plan', 'sammy_subscription_tier'],
+    ['email', 'original_source_channel', 'person_original_channel', 'sammy_pricing_plan', 'sammy_promo_code', 'sammy_subscription_tier'],
   );
 
   const thirtyDaysAgoMs = Date.now() - 30 * 86400000;
@@ -100,18 +100,38 @@ function determineClosingChannel(contact, callsByContact, meetingsByContact) {
   return contact.properties.original_source_channel || '_unknown';
 }
 
+function customerMRR(c) {
+  const plan = c.properties.sammy_pricing_plan;
+  let price = PLAN_PRICING[plan] ?? PLAN_PRICING.default;
+  // $10/mo promo discount lives in Stripe, fingerprinted by sammy_promo_code in HubSpot
+  if (c.properties.sammy_promo_code) price = Math.max(price - 10, 0);
+  return price;
+}
+
 function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact }) {
   const init = {};
-  for (const c of CHANNELS) init[c.key] = { customers: 0, mrr: 0, new30d: 0, totalTouches: 0, originMix: {} };
+  const acq = {};
+  for (const c of CHANNELS) {
+    init[c.key] = { customers: 0, mrr: 0, new30d: 0, totalTouches: 0, originMix: {} };
+    acq[c.key] = { customers: 0, mrr: 0, new30d: 0 };
+  }
   init['_unknown'] = { customers: 0, mrr: 0, new30d: 0, totalTouches: 0, originMix: {} };
+  acq['_unknown'] = { customers: 0, mrr: 0, new30d: 0 };
 
   for (const c of paidCustomers) {
+    const price = customerMRR(c);
+
+    // ACQUISITION view: which channel acquired the human.
+    // person_original_channel counts multi-account humans once, credited to their first touch.
+    const origin0 = c.properties.person_original_channel || c.properties.original_source_channel || '_unknown';
+    const abucket = acq[origin0] || acq['_unknown'];
+    abucket.customers += 1;
+    abucket.mrr += price;
+
+    // CLOSING view: sales effectiveness
     const closing = determineClosingChannel(c, callsByContact, meetingsByContact);
     const bucket = init[closing] || init['_unknown'];
     bucket.customers += 1;
-
-    const plan = c.properties.sammy_pricing_plan;
-    const price = PLAN_PRICING[plan] ?? PLAN_PRICING.default;
     bucket.mrr += price;
 
     const calls = callsByContact[c.id] || 0;
@@ -127,34 +147,45 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact })
     const ch = c.properties.original_source_channel || '_unknown';
     const bucket = init[ch] || init['_unknown'];
     bucket.new30d += 1;
+    (acq[ch] || acq['_unknown']).new30d += 1;
   }
 
   const rows = CHANNELS.map(c => {
     const a = init[c.key];
-    const roi = c.cost > 0 ? Math.round(((a.mrr - c.cost) / c.cost) * 100) : null;
     const avgTouches = a.customers > 0 ? +(a.totalTouches / a.customers).toFixed(1) : 0;
     return {
-      key: c.key, label: c.label, cost: c.cost,
+      key: c.key, label: c.label,
       customers: a.customers, mrr: a.mrr, new30d: a.new30d,
-      avgTouches, originMix: a.originMix, roi,
+      avgTouches, originMix: a.originMix,
     };
   });
-
   rows.sort((a, b) => b.mrr - a.mrr || b.customers - a.customers);
+
+  // Acquisition (budget) view: costs and ROI belong here, charged against the
+  // channel that ACQUIRED the customer, not the channel that closed them.
+  const acqRows = CHANNELS.map(c => {
+    const a = acq[c.key];
+    const roi = c.cost > 0 ? Math.round(((a.mrr - c.cost) / c.cost) * 100) : null;
+    return { key: c.key, label: c.label, cost: c.cost, customers: a.customers, mrr: a.mrr, new30d: a.new30d, roi };
+  });
+  acqRows.sort((a, b) => b.mrr - a.mrr || b.customers - a.customers);
+  const acqTotals = acqRows.reduce((t, r) => ({
+    customers: t.customers + r.customers, mrr: t.mrr + r.mrr, new30d: t.new30d + r.new30d, cost: t.cost + r.cost,
+  }), { customers: 0, mrr: 0, new30d: 0, cost: 0 });
+  acqTotals.roi = acqTotals.cost > 0 ? Math.round(((acqTotals.mrr - acqTotals.cost) / acqTotals.cost) * 100) : null;
+  const acqUnknown = acq['_unknown'];
 
   const totals = rows.reduce((t, r) => ({
     customers: t.customers + r.customers,
     mrr: t.mrr + r.mrr,
     new30d: t.new30d + r.new30d,
-    cost: t.cost + r.cost,
     totalTouches: t.totalTouches + (init[r.key].totalTouches || 0),
-  }), { customers: 0, mrr: 0, new30d: 0, cost: 0, totalTouches: 0 });
-  totals.roi = totals.cost > 0 ? Math.round(((totals.mrr - totals.cost) / totals.cost) * 100) : null;
+  }), { customers: 0, mrr: 0, new30d: 0, totalTouches: 0 });
   totals.avgTouches = totals.customers > 0 ? +(totals.totalTouches / totals.customers).toFixed(1) : 0;
 
   const unknown = init['_unknown'];
 
-  return { rows, totals, unknown };
+  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown };
 }
 
 let cache = { data: null, time: 0, error: null, loading: null };
@@ -184,7 +215,7 @@ async function getData(force = false) {
 function fmtMoney(n) { return '$' + Math.round(n).toLocaleString(); }
 function fmtROI(roi) { if (roi === null) return '<span class="muted">N/A</span>'; const cls = roi >= 0 ? 'pos' : 'neg'; return `<span class="${cls}">${roi}%</span>`; }
 function fmtAge(iso) {
-  if (!iso) return '—';
+  if (!iso) return '-';
   const sec = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
   if (sec < 60) return `${sec}s ago`;
   if (sec < 3600) return `${Math.round(sec / 60)} min ago`;
@@ -197,10 +228,10 @@ function renderHTML(data, error) {
       <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fafafa;color:#333}</style>
       </head><body><div><p>Loading data from HubSpot…</p>${error ? `<p style="color:#b00">Error: ${error}</p>` : ''}<script>setTimeout(()=>location.reload(),3000)</script></div></body></html>`;
   }
-  const { rows, totals, unknown, fetchedAt } = data;
+  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, fetchedAt } = data;
   const fmtOriginMix = (mix) => {
     const entries = Object.entries(mix).sort((a, b) => b[1] - a[1]);
-    if (entries.length === 0) return '<span class="muted">—</span>';
+    if (entries.length === 0) return '<span class="muted">-</span>';
     return entries.map(([k, v]) => {
       const labelMap = { cold_email: 'Email', cold_call: 'Call', organic_inbound: 'Organic', user_generated: 'UGC', linkedin_automation: 'LinkedIn', paid_ads: 'Ads', referral: 'Ref', _unknown: '?' };
       return `<span class="mix-tag">${labelMap[k] || k} ${v}</span>`;
@@ -211,10 +242,17 @@ function renderHTML(data, error) {
       <td class="label">${r.label}</td>
       <td class="num">${r.customers}</td>
       <td class="num">${fmtMoney(r.mrr)}</td>
-      <td class="num">${r.avgTouches > 0 ? r.avgTouches : '<span class="muted">—</span>'}</td>
-      <td class="mix">${r.customers > 0 ? fmtOriginMix(r.originMix) : '<span class="muted">—</span>'}</td>
+      <td class="num">${r.avgTouches > 0 ? r.avgTouches : '<span class="muted">-</span>'}</td>
+      <td class="mix">${r.customers > 0 ? fmtOriginMix(r.originMix) : '<span class="muted">-</span>'}</td>
+    </tr>`).join('');
+
+  const acqRowHtml = acqRows.map(r => `
+    <tr class="${r.customers === 0 && r.new30d === 0 ? 'dim' : ''}">
+      <td class="label">${r.label}</td>
+      <td class="num">${r.customers}</td>
+      <td class="num">${fmtMoney(r.mrr)}</td>
       <td class="num">${r.new30d}</td>
-      <td class="num">${r.cost > 0 ? fmtMoney(r.cost) : '<span class="muted">—</span>'}</td>
+      <td class="num">${r.cost > 0 ? fmtMoney(r.cost) : '<span class="muted">n/a</span>'}</td>
       <td class="num">${fmtROI(r.roi)}</td>
     </tr>`).join('');
 
@@ -234,6 +272,8 @@ function renderHTML(data, error) {
   .meta{color:#888;font-size:13px;margin-bottom:24px}
   .meta .refresh{color:#0066cc;cursor:pointer;text-decoration:none}
   .meta .refresh:hover{text-decoration:underline}
+  .section-title{font-size:16px;font-weight:600;margin:26px 0 2px;letter-spacing:-0.2px}
+  .section-sub{color:#888;font-size:12.5px;margin-bottom:10px;line-height:1.5}
   .card{background:#fff;border:1px solid #eee;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.03)}
   table{width:100%;border-collapse:collapse;font-size:14px}
   thead th{text-align:right;padding:14px 16px;font-weight:600;color:#666;background:#fafafa;border-bottom:1px solid #eee;font-size:12px;text-transform:uppercase;letter-spacing:0.5px}
@@ -264,6 +304,37 @@ function renderHTML(data, error) {
 <div class="container">
   <h1>Sammy Attribution</h1>
   <p class="meta">Updated ${fmtAge(fetchedAt)} &middot; <a class="refresh" href="/?force=1">refresh now</a></p>
+
+  <h2 class="section-title">Acquisition (budget view)</h2>
+  <p class="section-sub">Which channel brought each paying customer in. One row per human: linked accounts count once, credited to the first channel that reached them. Spend decisions read from this table.</p>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Channel</th>
+          <th>Customers</th>
+          <th>MRR</th>
+          <th>New (30d)</th>
+          <th>Cost/mo</th>
+          <th>ROI</th>
+        </tr>
+      </thead>
+      <tbody>${acqRowHtml}</tbody>
+      <tfoot>
+        <tr>
+          <td>Total</td>
+          <td class="num">${acqTotals.customers}</td>
+          <td class="num">${fmtMoney(acqTotals.mrr)}</td>
+          <td class="num">${acqTotals.new30d}</td>
+          <td class="num">${fmtMoney(acqTotals.cost)}</td>
+          <td class="num">${fmtROI(acqTotals.roi)}</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
+  <h2 class="section-title">Sales effectiveness (closing view)</h2>
+  <p class="section-sub">How customers were closed once acquired. 2+ calls or 1+ meeting counts as a sales-led close. This view measures the sales motion, not channel spend, so ROI does not apply here.</p>
   <div class="card">
     <table>
       <thead>
@@ -273,9 +344,6 @@ function renderHTML(data, error) {
           <th>MRR</th>
           <th>Avg Touches</th>
           <th>Originated From</th>
-          <th>New (30d)</th>
-          <th>Cost/mo</th>
-          <th>ROI</th>
         </tr>
       </thead>
       <tbody>${rowHtml}</tbody>
@@ -286,19 +354,17 @@ function renderHTML(data, error) {
           <td class="num">${fmtMoney(totals.mrr)}</td>
           <td class="num">${totals.avgTouches}</td>
           <td></td>
-          <td class="num">${totals.new30d}</td>
-          <td class="num">${fmtMoney(totals.cost)}</td>
-          <td class="num">${fmtROI(totals.roi)}</td>
         </tr>
       </tfoot>
     </table>
   </div>
-  ${unknown.customers > 0 || unknown.new30d > 0 ? `<div class="unknown-warning"><strong>${unknown.customers}</strong> paying customer(s) and <strong>${unknown.new30d}</strong> recent contact(s) have no <code>original_source_channel</code> set yet. Run the attribution backfill to classify them.</div>` : ''}
+  ${unknown.customers > 0 || unknown.new30d > 0 ? `<div class="unknown-warning"><strong>${unknown.customers}</strong> paying customer(s) and <strong>${unknown.new30d}</strong> recent contact(s) have no <code>original_source_channel</code> set yet. The hourly classifier will pick them up on its next run.</div>` : ''}
   <p class="footnote">
+    <strong>Acquisition</strong> reads <code>person_original_channel</code> (person level, set by the governed classifier) with <code>original_source_channel</code> as fallback. MRR uses <code>sammy_pricing_plan</code> minus the $10 promo discount where <code>sammy_promo_code</code> is set.
+    <strong>ROI</strong> = (MRR minus monthly cost) / cost, charged to the acquiring channel. Paid ads cost is an estimate pending actual Meta spend numbers; cold call cost covers the whole sales team, which also closes deals sourced by other channels, so treat its ROI as conservative.
     <strong>Closing Channel</strong> = where the deal was actually closed. Rule: 2+ calls or 1+ meeting on a paid customer means sales-led close (cold_call); otherwise the original lead source wins.
     <strong>Avg Touches</strong> = average calls + meetings per paid customer in that bucket.
     <strong>Originated From</strong> = of the customers closed here, where they originally entered HubSpot (Email = cold email, Organic = inbound form, UGC = manual/user-generated).
-    <strong>New (30d)</strong> = recent leads grouped by their <em>originating</em> channel (no close yet).
     Source: HubSpot, cached 5 min. <a class="refresh" href="/?force=1">Force refresh</a>.
   </p>
 </div>
