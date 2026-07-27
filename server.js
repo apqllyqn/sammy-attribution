@@ -144,6 +144,30 @@ async function fetchData() {
 
   const instantly = await fetchInstantly(paidCustomers);
 
+  // Leak-junk cohort: ownerless members of HubSpot list 835 (cold-email webhook
+  // leak, no owner, no activity). Excluded from funnel denominators per Chris,
+  // with a visible callout. Self-corrects if the contacts are ever deleted.
+  let junk = null;
+  try {
+    const jids = [];
+    let jafter;
+    while (true) {
+      const { data } = await withRetry(() => api.get(`/crm/v3/lists/835/memberships?limit=250${jafter ? `&after=${jafter}` : ''}`));
+      for (const r of data.results || []) jids.push(String(typeof r === 'object' ? r.recordId : r));
+      if (!data.paging?.next?.after) break;
+      jafter = data.paging.next.after;
+    }
+    let ownerless = 0;
+    for (let i = 0; i < jids.length; i += 100) {
+      const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read',
+        { inputs: jids.slice(i, i + 100).map(id => ({ id })), properties: ['hubspot_owner_id'] }));
+      ownerless += (data.results || []).filter(r => !r.properties.hubspot_owner_id).length;
+    }
+    junk = { listSize: jids.length, ownerless };
+  } catch (err) {
+    console.error('[junk] list 835 fetch failed:', err.response?.status || err.message);
+  }
+
   // Funnel counts: per-channel contact totals (cheap total-only searches) +
   // one paged pull of everyone with a user_status, bucketed by channel.
   const funnel = {};
@@ -169,7 +193,7 @@ async function fetchData() {
     else if (st === 'churned') b.churned += 1;
   }
 
-  return { paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel, fetchedAt: new Date().toISOString() };
+  return { paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel, junk, fetchedAt: new Date().toISOString() };
 }
 
 // Closing-channel attribution: which channel actually closed the deal?
@@ -196,7 +220,7 @@ function customerMRR(c) {
   return price;
 }
 
-function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel }) {
+function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel, junk }) {
   const init = {};
   const acq = {};
   for (const c of CHANNELS) {
@@ -337,9 +361,11 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
   }
 
   const pct = (n, d) => d > 0 ? Math.round((n / d) * 1000) / 10 : null;
+  const junkExcluded = junk ? junk.ownerless : 0;
   const funnelRows = CHANNELS
     .map(c => {
-      const f = funnel[c.key] || { contacts: 0, signups: 0, trials: 0, paid: 0, churned: 0 };
+      const f = { ...(funnel[c.key] || { contacts: 0, signups: 0, trials: 0, paid: 0, churned: 0 }) };
+      if (c.key === 'cold_email' && junkExcluded) f.contacts = Math.max(f.contacts - junkExcluded, 0);
       return {
         key: c.key, label: c.label, ...f,
         signupRate: pct(f.signups, f.contacts),
@@ -351,7 +377,7 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
     .filter(r => r.contacts > 0)
     .sort((a, b) => b.paid - a.paid || b.contacts - a.contacts);
 
-  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows };
+  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded };
 }
 
 let cache = { data: null, time: 0, error: null, loading: null };
@@ -394,7 +420,7 @@ function renderHTML(data, error) {
       <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fafafa;color:#333}</style>
       </head><body><div><p>Loading data from HubSpot…</p>${error ? `<p style="color:#b00">Error: ${error}</p>` : ''}<script>setTimeout(()=>location.reload(),3000)</script></div></body></html>`;
   }
-  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, fetchedAt } = data;
+  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded, fetchedAt } = data;
   const fmtOriginMix = (mix) => {
     const entries = Object.entries(mix).sort((a, b) => b[1] - a[1]);
     if (entries.length === 0) return '<span class="muted">-</span>';
@@ -616,6 +642,8 @@ function renderHTML(data, error) {
       </tfoot>
     </table>
   </div>
+
+  ${junkExcluded ? `<div class="unknown-warning" style="margin-top:12px;padding:10px 14px;background:#fff8e1;border:1px solid #ffe082;border-radius:6px;font-size:13px;color:#666">Cold Email contact counts above exclude <strong>${junkExcluded}</strong> known junk contacts from the reply-webhook leak (no owner, no activity, held in the deletion review list). They remain in HubSpot and in the raw acquisition counts; only the funnel rates ignore them.</div>` : ''}
 
   <h2 class="section-title">Sales effectiveness (closing view)</h2>
   <p class="section-sub">How customers were closed once acquired. 2+ calls or 1+ meeting counts as a sales-led close. This view measures the sales motion, not channel spend, so ROI does not apply here.</p>
