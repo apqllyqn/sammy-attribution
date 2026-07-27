@@ -127,7 +127,7 @@ async function fetchInstantly(paidCustomers) {
 async function fetchData() {
   const paidCustomers = await searchContacts(
     [{ propertyName: 'user_status', operator: 'EQ', value: 'paid_customer' }],
-    ['email', 'original_source_channel', 'person_original_channel', 'sammy_pricing_plan', 'sammy_promo_code', 'sammy_subscription_tier', 'sammy_utm_campaign', 'hs_additional_emails'],
+    ['email', 'original_source_channel', 'person_original_channel', 'sammy_pricing_plan', 'sammy_promo_code', 'sammy_subscription_tier', 'sammy_utm_campaign', 'cold_email_reply_campaign', 'hs_additional_emails'],
   );
 
   const thirtyDaysAgoMs = Date.now() - 30 * 86400000;
@@ -235,6 +235,9 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
       let campKey = null;
       const stamp = c.properties.sammy_utm_campaign;
       if (stamp && instantly && (instantly.analytics || []).some(a => a.campaign_name === stamp)) campKey = 'name:' + stamp;
+      // Clay writes the replied-to campaign name (covers Instantly AND legacy
+      // EmailBison-era campaigns); cross-validated against stamps and lead matches
+      if (!campKey && c.properties.cold_email_reply_campaign) campKey = 'name:' + c.properties.cold_email_reply_campaign;
       if (!campKey && instantly) {
         const emails = [c.properties.email, ...(c.properties.hs_additional_emails || '').split(';')]
           .map(e => (e || '').trim().toLowerCase()).filter(Boolean);
@@ -321,8 +324,16 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
     for (const a of instantly.analytics || []) { creditedKeys.add('id:' + a.campaign_id); creditedKeys.add('name:' + a.campaign_name); }
     campaignOther = { customers: 0, mrr: 0 };
     for (const [k, v] of Object.entries(campaignPaid)) {
-      if (k === 'other' || !creditedKeys.has(k)) { campaignOther.customers += v.customers; campaignOther.mrr += v.mrr; }
+      if (k === 'other') { campaignOther.customers += v.customers; campaignOther.mrr += v.mrr; continue; }
+      if (creditedKeys.has(k)) continue;
+      if (k.startsWith('name:')) {
+        // Named campaign with no Instantly analytics = legacy platform era.
+        campaignRows.push({ name: k.slice(5), status: null, contacted: null, replies: null, interested: null, customers: v.customers, mrr: v.mrr });
+      } else {
+        campaignOther.customers += v.customers; campaignOther.mrr += v.mrr;
+      }
     }
+    campaignRows.sort((a, b) => b.mrr - a.mrr || (b.contacted || 0) - (a.contacted || 0));
   }
 
   const pct = (n, d) => d > 0 ? Math.round((n / d) * 1000) / 10 : null;
@@ -416,15 +427,16 @@ function renderHTML(data, error) {
   let campaignSection = '';
   if (campaignRows) {
     const totalCamp = campaignRows.reduce((t, r) => ({
-      contacted: t.contacted + r.contacted, replies: t.replies + r.replies,
-      interested: t.interested + r.interested, customers: t.customers + r.customers, mrr: t.mrr + r.mrr,
+      contacted: t.contacted + (r.contacted || 0), replies: t.replies + (r.replies || 0),
+      interested: t.interested + (r.interested || 0), customers: t.customers + r.customers, mrr: t.mrr + r.mrr,
     }), { contacted: 0, replies: 0, interested: 0, customers: campaignOther.customers, mrr: campaignOther.mrr });
+    const na = '<span class="muted">n/a</span>';
     const campHtml = campaignRows.map(r => `
     <tr class="${r.customers === 0 && r.status !== 1 ? 'dim' : ''}">
-      <td class="label">${r.name} ${r.status === 1 ? '<span class="mix-tag">Active</span>' : `<span class="muted" style="font-size:11px">${STATUS_LABEL[r.status] || ''}</span>`}</td>
-      <td class="num">${r.contacted.toLocaleString()}</td>
-      <td class="num">${r.replies}</td>
-      <td class="num">${r.interested}</td>
+      <td class="label">${r.name} ${r.status === 1 ? '<span class="mix-tag">Active</span>' : r.status === null ? '<span class="muted" style="font-size:11px">Legacy</span>' : `<span class="muted" style="font-size:11px">${STATUS_LABEL[r.status] || ''}</span>`}</td>
+      <td class="num">${r.contacted === null ? na : r.contacted.toLocaleString()}</td>
+      <td class="num">${r.replies === null ? na : r.replies}</td>
+      <td class="num">${r.interested === null ? na : r.interested}</td>
       <td class="num">${r.customers || '<span class="muted">0</span>'}</td>
       <td class="num">${r.mrr ? fmtMoney(r.mrr) : '<span class="muted">-</span>'}</td>
     </tr>`).join('');
@@ -438,7 +450,7 @@ function renderHTML(data, error) {
       </thead>
       <tbody>${campHtml}
     <tr>
-      <td class="label muted">Other cold email (Clay, EmailBison era, removed Instantly leads)</td>
+      <td class="label muted">Other cold email (no campaign signal on record)</td>
       <td class="num"><span class="muted">n/a</span></td>
       <td class="num"><span class="muted">n/a</span></td>
       <td class="num"><span class="muted">n/a</span></td>
@@ -640,7 +652,7 @@ function renderHTML(data, error) {
     <strong>Avg Touches</strong> = average calls + meetings per paid customer in that bucket.
     <strong>Funnel</strong> counts are contact-level by source channel (person-level linking makes the acquisition table differ by a customer or so). In Trial is a current snapshot, not everyone who ever trialed, because the app overwrites trial status on conversion or expiry. Churn % = churned / (paying + churned).
     <strong>Originated From</strong> = of the customers closed here, where they originally entered HubSpot (Email = cold email, Organic = inbound form, UGC = manual/user-generated).
-    <strong>Cold email by campaign</strong>: denominators from Instantly analytics; paying customers matched by campaign stamp or live lead lookup (primary and secondary emails). Customers acquired before Instantly or whose leads were removed cannot be re-matched and stay in the "Other" row; campaign stamping at contact creation (sammy-dashboard webhook update) grows verified coverage over time.
+    <strong>Cold email by campaign</strong>: denominators from Instantly analytics; paying customers matched by campaign stamp, the Clay-written reply campaign field, or live lead lookup (primary and secondary emails). Legacy rows are pre-Instantly campaigns recovered from reply data; their send volumes are not available. Customers acquired before Instantly or whose leads were removed cannot be re-matched and stay in the "Other" row; campaign stamping at contact creation (sammy-dashboard webhook update) grows verified coverage over time.
     Source: HubSpot, cached 5 min. <a class="refresh" href="/?force=1">Force refresh</a>.
   </p>
 </div>
