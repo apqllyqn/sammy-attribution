@@ -156,11 +156,18 @@ function determineClosingChannel(contact, callsByContact, meetingsByContact) {
   return contact.properties.original_source_channel || '_unknown';
 }
 
+// Recurring monthly discounts by promo code. One-time coupons (e.g. 50% off
+// first month) do NOT reduce ongoing MRR and must not appear here.
+const PROMO_MONTHLY_DISCOUNT = {
+  qRlQX1PO: 10,               // $10/mo off, recurring
+  // oJiHwI0k / FIRSTMO50: 50% off first month only - no MRR impact
+};
+
 function customerMRR(c) {
   const plan = c.properties.sammy_pricing_plan;
   let price = PLAN_PRICING[plan] ?? PLAN_PRICING.default;
-  // $10/mo promo discount lives in Stripe, fingerprinted by sammy_promo_code in HubSpot
-  if (c.properties.sammy_promo_code) price = Math.max(price - 10, 0);
+  const discount = PROMO_MONTHLY_DISCOUNT[c.properties.sammy_promo_code];
+  if (discount) price = Math.max(price - discount, 0);
   return price;
 }
 
