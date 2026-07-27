@@ -144,7 +144,32 @@ async function fetchData() {
 
   const instantly = await fetchInstantly(paidCustomers);
 
-  return { paidCustomers, recent, callsByContact, meetingsByContact, instantly, fetchedAt: new Date().toISOString() };
+  // Funnel counts: per-channel contact totals (cheap total-only searches) +
+  // one paged pull of everyone with a user_status, bucketed by channel.
+  const funnel = {};
+  for (const ch of CHANNELS) {
+    const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/search', {
+      filterGroups: [{ filters: [{ propertyName: 'original_source_channel', operator: 'EQ', value: ch.key }] }],
+      limit: 1,
+    }));
+    funnel[ch.key] = { contacts: data.total, signups: 0, trials: 0, paid: 0, churned: 0 };
+    await sleep(120);
+  }
+  const statusContacts = await searchContacts(
+    [{ propertyName: 'user_status', operator: 'HAS_PROPERTY' }],
+    ['original_source_channel', 'user_status'],
+  );
+  for (const c of statusContacts) {
+    const b = funnel[c.properties.original_source_channel];
+    if (!b) continue;
+    b.signups += 1;
+    const st = c.properties.user_status;
+    if (st === 'active_trial' || st === 'trial_expired') b.trials += 1;
+    else if (st === 'paid_customer') b.paid += 1;
+    else if (st === 'churned') b.churned += 1;
+  }
+
+  return { paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel, fetchedAt: new Date().toISOString() };
 }
 
 // Closing-channel attribution: which channel actually closed the deal?
@@ -171,7 +196,7 @@ function customerMRR(c) {
   return price;
 }
 
-function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, instantly }) {
+function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel }) {
   const init = {};
   const acq = {};
   for (const c of CHANNELS) {
@@ -300,7 +325,22 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
     }
   }
 
-  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther };
+  const pct = (n, d) => d > 0 ? Math.round((n / d) * 1000) / 10 : null;
+  const funnelRows = CHANNELS
+    .map(c => {
+      const f = funnel[c.key] || { contacts: 0, signups: 0, trials: 0, paid: 0, churned: 0 };
+      return {
+        key: c.key, label: c.label, ...f,
+        signupRate: pct(f.signups, f.contacts),
+        contactToPaid: pct(f.paid, f.contacts),
+        signupToPaid: pct(f.paid, f.signups),
+        churnRate: pct(f.churned, f.paid + f.churned),
+      };
+    })
+    .filter(r => r.contacts > 0)
+    .sort((a, b) => b.paid - a.paid || b.contacts - a.contacts);
+
+  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows };
 }
 
 let cache = { data: null, time: 0, error: null, loading: null };
@@ -343,7 +383,7 @@ function renderHTML(data, error) {
       <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fafafa;color:#333}</style>
       </head><body><div><p>Loading data from HubSpot…</p>${error ? `<p style="color:#b00">Error: ${error}</p>` : ''}<script>setTimeout(()=>location.reload(),3000)</script></div></body></html>`;
   }
-  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, fetchedAt } = data;
+  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, fetchedAt } = data;
   const fmtOriginMix = (mix) => {
     const entries = Object.entries(mix).sort((a, b) => b[1] - a[1]);
     if (entries.length === 0) return '<span class="muted">-</span>';
@@ -529,6 +569,42 @@ function renderHTML(data, error) {
     </table>
   </div>
 
+  <h2 class="section-title">Funnel and conversion by channel</h2>
+  <p class="section-sub">Contact counts by source channel, through signup to paid. Signup to Paid shows how well each channel's leads close once they enter the product; Churn is the share of ever-paying customers that have left.</p>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Channel</th><th>Contacts</th><th>Signed Up</th><th>Signup %</th><th>In Trial</th><th>Paying</th><th>Contact&rarr;Paid</th><th>Signup&rarr;Paid</th><th>Churned</th><th>Churn %</th></tr>
+      </thead>
+      <tbody>${funnelRows.map(r => `
+    <tr>
+      <td class="label">${r.label}</td>
+      <td class="num">${r.contacts.toLocaleString()}</td>
+      <td class="num">${r.signups}</td>
+      <td class="num">${r.signupRate === null ? '<span class="muted">-</span>' : r.signupRate + '%'}</td>
+      <td class="num">${r.trials}</td>
+      <td class="num">${r.paid}</td>
+      <td class="num">${r.contactToPaid === null ? '<span class="muted">-</span>' : r.contactToPaid + '%'}</td>
+      <td class="num">${r.signupToPaid === null ? '<span class="muted">-</span>' : r.signupToPaid + '%'}</td>
+      <td class="num">${r.churned}</td>
+      <td class="num">${r.churnRate === null ? '<span class="muted">-</span>' : `<span class="${r.churnRate >= 30 ? 'neg' : ''}">${r.churnRate}%</span>`}</td>
+    </tr>`).join('')}</tbody>
+      <tfoot>
+        <tr>
+          <td>Total</td>
+          <td class="num">${funnelRows.reduce((t, r) => t + r.contacts, 0).toLocaleString()}</td>
+          <td class="num">${funnelRows.reduce((t, r) => t + r.signups, 0)}</td>
+          <td></td>
+          <td class="num">${funnelRows.reduce((t, r) => t + r.trials, 0)}</td>
+          <td class="num">${funnelRows.reduce((t, r) => t + r.paid, 0)}</td>
+          <td></td><td></td>
+          <td class="num">${funnelRows.reduce((t, r) => t + r.churned, 0)}</td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
   <h2 class="section-title">Sales effectiveness (closing view)</h2>
   <p class="section-sub">How customers were closed once acquired. 2+ calls or 1+ meeting counts as a sales-led close. This view measures the sales motion, not channel spend, so ROI does not apply here.</p>
   <div class="card">
@@ -562,6 +638,7 @@ function renderHTML(data, error) {
     <strong>ROI</strong> = (MRR minus monthly cost) / cost, charged to the acquiring channel. Paid ads cost is an estimate pending actual Meta spend numbers; cold call cost covers the whole sales team, which also closes deals sourced by other channels, so treat its ROI as conservative.
     <strong>Closing Channel</strong> = where the deal was actually closed. Rule: 2+ calls or 1+ meeting on a paid customer means sales-led close (cold_call); otherwise the original lead source wins.
     <strong>Avg Touches</strong> = average calls + meetings per paid customer in that bucket.
+    <strong>Funnel</strong> counts are contact-level by source channel (person-level linking makes the acquisition table differ by a customer or so). In Trial is a current snapshot, not everyone who ever trialed, because the app overwrites trial status on conversion or expiry. Churn % = churned / (paying + churned).
     <strong>Originated From</strong> = of the customers closed here, where they originally entered HubSpot (Email = cold email, Organic = inbound form, UGC = manual/user-generated).
     <strong>Cold email by campaign</strong>: denominators from Instantly analytics; paying customers matched by campaign stamp or live lead lookup (primary and secondary emails). Customers acquired before Instantly or whose leads were removed cannot be re-matched and stay in the "Other" row; campaign stamping at contact creation (sammy-dashboard webhook update) grows verified coverage over time.
     Source: HubSpot, cached 5 min. <a class="refresh" href="/?force=1">Force refresh</a>.
