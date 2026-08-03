@@ -133,7 +133,7 @@ async function fetchData() {
   const thirtyDaysAgoMs = Date.now() - 30 * 86400000;
   const recent = await searchContacts(
     [{ propertyName: 'createdate', operator: 'GTE', value: String(thirtyDaysAgoMs) }],
-    ['email', 'original_source_channel', 'createdate'],
+    ['email', 'original_source_channel', 'createdate', 'firstname', 'phone', 'hs_calculated_phone_number', 'hs_object_source_label', 'hs_object_source_detail_1'],
   );
 
   // Bulk-fetch all calls and meetings, tally per contact
@@ -360,6 +360,23 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
     campaignRows.sort((a, b) => b.mrr - a.mrr || (b.contacted || 0) - (a.contacted || 0));
   }
 
+  // Data quality: recent contacts arriving without a dialable phone, by source
+  const sevenDaysAgo = Date.now() - 7 * 86400000;
+  const phonelessSrc = {};
+  let phoneless7 = 0, phoneless30 = 0;
+  for (const c of recent) {
+    const p = c.properties;
+    if (p.hs_calculated_phone_number || p.phone) continue;
+    const key = p.hs_object_source_detail_1 || p.hs_object_source_label || 'unknown source';
+    const e = phonelessSrc[key] = phonelessSrc[key] || { d7: 0, d30: 0, nameless: 0 };
+    e.d30 += 1; phoneless30 += 1;
+    if (!p.firstname) e.nameless += 1;
+    if (new Date(p.createdate).getTime() >= sevenDaysAgo) { e.d7 += 1; phoneless7 += 1; }
+  }
+  const phonelessRows = Object.entries(phonelessSrc)
+    .map(([source, e]) => ({ source, ...e }))
+    .sort((a, b) => b.d30 - a.d30);
+
   const pct = (n, d) => d > 0 ? Math.round((n / d) * 1000) / 10 : null;
   const junkExcluded = junk ? junk.ownerless : 0;
   const funnelRows = CHANNELS
@@ -377,7 +394,7 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
     .filter(r => r.contacts > 0)
     .sort((a, b) => b.paid - a.paid || b.contacts - a.contacts);
 
-  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded };
+  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded, phonelessRows, phoneless7, phoneless30, recent30: recent.length };
 }
 
 let cache = { data: null, time: 0, error: null, loading: null };
@@ -420,7 +437,7 @@ function renderHTML(data, error) {
       <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fafafa;color:#333}</style>
       </head><body><div><p>Loading data from HubSpot…</p>${error ? `<p style="color:#b00">Error: ${error}</p>` : ''}<script>setTimeout(()=>location.reload(),3000)</script></div></body></html>`;
   }
-  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded, fetchedAt } = data;
+  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded, phonelessRows, phoneless7, phoneless30, recent30, fetchedAt } = data;
   const fmtOriginMix = (mix) => {
     const entries = Object.entries(mix).sort((a, b) => b[1] - a[1]);
     if (entries.length === 0) return '<span class="muted">-</span>';
@@ -516,6 +533,26 @@ function renderHTML(data, error) {
   }).join('');
   const xtabColTotals = closingKeys.map(k => originKeys.reduce((t, o) => t + (crosstab[o][k] || 0), 0));
   const crosstabSection = `
+  <h2 class="section-title">Data quality: contacts arriving without phone numbers</h2>
+  <p class="section-sub">New contacts whose creation source did not supply a dialable phone. These get no call task until a number lands, so this table shows which pipes need tightening. ${phoneless30} of the last 30 days' ${recent30} new contacts arrived phoneless (${phoneless7} in the last 7 days).</p>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Creation Source</th><th>Last 7 Days</th><th>Last 30 Days</th><th>Also Missing Name (30d)</th></tr>
+      </thead>
+      <tbody>${phonelessRows.map(r => `
+    <tr class="${r.d7 === 0 ? 'dim' : ''}">
+      <td class="label">${r.source}</td>
+      <td class="num">${r.d7 || '<span class="muted">0</span>'}</td>
+      <td class="num">${r.d30}</td>
+      <td class="num">${r.nameless || '<span class="muted">0</span>'}</td>
+    </tr>`).join('') || '<tr><td class="label muted" colspan="4">No phoneless contacts in the last 30 days</td></tr>'}</tbody>
+      <tfoot>
+        <tr><td>Total</td><td class="num">${phoneless7}</td><td class="num">${phoneless30}</td><td class="num">${phonelessRows.reduce((t, r) => t + r.nameless, 0)}</td></tr>
+      </tfoot>
+    </table>
+  </div>
+
   <h2 class="section-title">Origination x closing</h2>
   <p class="section-sub">Rows are where customers came from, columns are how they were closed. Read a row to see how much of a channel's pipeline the sales team converts versus self-serve.</p>
   <div class="card">
