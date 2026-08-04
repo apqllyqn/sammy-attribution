@@ -853,16 +853,26 @@ async function fetchLucasData() {
     await sleep(150);
   }
 
-  const activations = await searchAll('contacts', [
-    { propertyName: 'sammy_trial_start_date', operator: 'GTE', value: wk },
-  ], ['firstname', 'lastname', 'email', 'user_status', 'sammy_trial_start_date']);
+  // sales made = deals entering the won stage (moved automatically when a
+  // contact becomes a paying customer)
+  const wonDeals = await searchAll('deals', [
+    { propertyName: 'hs_v2_date_entered_decisionmakerboughtin', operator: 'GTE', value: wk },
+  ], ['dealname', 'amount', 'hs_v2_date_entered_decisionmakerboughtin']);
+  const dealContact = await assocMap('deals', wonDeals.map(d => d.id));
+  const dcids = [...new Set(Object.values(dealContact))].filter(id => !contacts[id]);
+  for (let i = 0; i < dcids.length; i += 100) {
+    const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read',
+      { inputs: dcids.slice(i, i + 100).map(id => ({ id })), properties: ['firstname', 'lastname', 'email', 'user_status', 'sammy_pricing_plan'] }));
+    for (const r of data.results || []) contacts[r.id] = r.properties;
+    await sleep(150);
+  }
 
-  return { calls, meetings: Object.values(meetings), callContact, mtgContact, contacts, activations,
+  return { calls, meetings: Object.values(meetings), callContact, mtgContact, contacts, wonDeals, dealContact,
            dayStart, weekStart, fetchedAt: new Date().toISOString() };
 }
 
 function lucasStats(d) {
-  const { calls, meetings, callContact, mtgContact, contacts, activations, dayStart, weekStart } = d;
+  const { calls, meetings, callContact, mtgContact, contacts, wonDeals, dealContact, dayStart, weekStart } = d;
   const inDay = ts => Number(new Date(ts)) >= dayStart;
   const cname = id => {
     const p = contacts[id];
@@ -899,14 +909,19 @@ function lucasStats(d) {
   const completedRows = byOutcome('COMPLETED');
   const closesRows = completedRows.filter(r => {
     const p = r.cid && contacts[r.cid];
-    return p && (p.sammy_trial_start_date || p.user_status);
-  }).map(r => ({ ...r, status: contacts[r.cid].user_status || 'trial started' }));
+    return p && p.user_status === 'paid_customer';
+  }).map(r => ({ ...r, status: 'paying customer' }));
 
-  const actRows = activations.map(c => ({
-    id: c.id, name: [c.properties.firstname, c.properties.lastname].filter(Boolean).join(' ') || c.properties.email,
-    status: c.properties.user_status || '', date: c.properties.sammy_trial_start_date,
-  })).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-  const todayYmd = new Date(dayStart).toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
+  const actRows = wonDeals.map(d => {
+    const cid = dealContact[d.id] || null;
+    const wonTs = Number(new Date(d.properties.hs_v2_date_entered_decisionmakerboughtin));
+    return {
+      id: cid, name: cid ? cname(cid) : (d.properties.dealname || 'deal'),
+      amount: parseFloat(d.properties.amount) || 0,
+      date: new Date(wonTs).toLocaleDateString('en-AU', { timeZone: 'Australia/Melbourne', day: 'numeric', month: 'short' }),
+      wonTs,
+    };
+  }).sort((a, b) => b.wonTs - a.wonTs);
 
   return {
     dials, unique, dialsDetail,
@@ -919,7 +934,8 @@ function lucasStats(d) {
     upcoming: thisWeekMtgs.filter(m => ['SCHEDULED', null, undefined, ''].includes(m.properties.hs_meeting_outcome)).length,
     upcomingRows: thisWeekMtgs.filter(m => ['SCHEDULED', null, undefined, ''].includes(m.properties.hs_meeting_outcome)).map(mrow).sort((a, b) => a.ts - b.ts),
     closes: closesRows.length, closesRows,
-    actWeek: actRows.length, actToday: actRows.filter(r => r.date === todayYmd).length, actRows,
+    actWeek: actRows.length, actToday: actRows.filter(r => r.wonTs >= dayStart).length,
+    actMrr: actRows.reduce((t, r) => t + r.amount, 0), actRows,
   };
 }
 
@@ -958,8 +974,8 @@ function renderLucas(s) {
     upcoming: mtgTable(s.upcomingRows),
     closes: s.closesRows.length ? `<table><thead><tr><th>Who</th><th>Meeting</th><th>Status</th></tr></thead><tbody>${
       s.closesRows.map(r => `<tr><td>${link(r.cid, r.name)}</td><td>${r.when}</td><td>${r.status}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>',
-    acts: s.actRows.length ? `<table><thead><tr><th>Who</th><th>Trial Started</th><th>Status Now</th></tr></thead><tbody>${
-      s.actRows.map(r => `<tr><td>${link(r.id, r.name)}</td><td>${r.date}</td><td>${r.status}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>',
+    acts: s.actRows.length ? `<table><thead><tr><th>Who</th><th>Became Paying</th><th>$/mo</th></tr></thead><tbody>${
+      s.actRows.map(r => `<tr><td>${link(r.id, r.name)}</td><td>${r.date}</td><td>${r.amount ? '$' + r.amount : ''}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>',
   };
   const tile = (big, lbl, sub, key) => `<div class="tile${key ? ' click' : ''}"${key ? ` onclick="show('${key}', this)"` : ''}><div class="big">${big}</div><div class="lbl">${lbl}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
   return `<!doctype html>
@@ -999,7 +1015,7 @@ function renderLucas(s) {
     ${tile(s.dials.today, 'Dials', '', 'dials')}
     ${tile(s.unique.today, 'Unique Dials', '', 'dials')}
     ${tile(s.booked.today, 'Demos Booked', 'via scheduler', 'booked')}
-    ${tile(s.actToday, 'Activations', 'trial starts, all sources', 'acts')}
+    ${tile(s.actToday, 'Sales Made', 'new paying customers', 'acts')}
   </div>
   <h2>This Week (Mon to now)</h2>
   <div class="wk">
@@ -1008,7 +1024,7 @@ function renderLucas(s) {
     ${tile(s.booked.week, 'Demos Booked', 'via scheduler', 'booked')}
     ${tile(s.completed, 'Demos Completed', '', 'completed')}
     ${tile(s.closes, 'Closed on Demo', 'completed + activated', 'closes')}
-    ${tile(s.actWeek, 'Activations', 'trial starts, all sources', 'acts')}
+    ${tile(s.actWeek, 'Sales Made', '$' + Math.round(s.actMrr) + '/mo added', 'acts')}
   </div>
   <h2>Meeting Outcomes This Week</h2>
   <div class="wk">
@@ -1021,7 +1037,7 @@ function renderLucas(s) {
   <p class="foot">
     Dials = outbound calls owned by Lucas. Unique = distinct numbers dialed; the dials panel shows attempts per person.
     Demos Booked = meetings created via the scheduling page this week. Outcome tiles cover meetings taking place this week; set the outcome on each meeting to keep these true.
-    Closed on Demo = contacts from this week's completed meetings who have a Sammy activation. Activations = contacts whose trial started this week, any source.
+    Closed on Demo = contacts from this week's completed meetings who are now paying customers. Sales Made = deals reaching the won stage this week (moved automatically when a customer starts paying), any source.
     Names link to the HubSpot record. Data refreshes every 5 minutes.
   </p>
 </div>
