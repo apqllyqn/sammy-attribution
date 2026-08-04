@@ -853,6 +853,13 @@ async function fetchLucasData() {
     await sleep(150);
   }
 
+  // closed on call: canonical definition = closed_on_call property (stamped
+  // hourly; paid same Melbourne day as a completed Lucas meeting)
+  const closedOnCall = await searchAll('contacts', [
+    { propertyName: 'closed_on_call', operator: 'EQ', value: 'true' },
+    { propertyName: 'became_paid_customer_date', operator: 'GTE', value: wk },
+  ], ['firstname', 'lastname', 'email', 'became_paid_customer_date']);
+
   // sales made = contacts whose became_paid_customer_date falls in the window.
   // Contact object is the source of truth (deals are moved downstream by a
   // workflow and can lag or miss associations).
@@ -860,12 +867,12 @@ async function fetchLucasData() {
     { propertyName: 'became_paid_customer_date', operator: 'GTE', value: wk },
   ], ['firstname', 'lastname', 'email', 'became_paid_customer_date', 'sammy_pricing_plan', 'sammy_promo_code']);
 
-  return { calls, meetings: Object.values(meetings), callContact, mtgContact, contacts, sales,
+  return { calls, meetings: Object.values(meetings), callContact, mtgContact, contacts, sales, closedOnCall,
            dayStart, weekStart, fetchedAt: new Date().toISOString() };
 }
 
 function lucasStats(d) {
-  const { calls, meetings, callContact, mtgContact, contacts, sales, dayStart, weekStart } = d;
+  const { calls, meetings, callContact, mtgContact, contacts, sales, closedOnCall, dayStart, weekStart } = d;
   const inDay = ts => Number(new Date(ts)) >= dayStart;
   const cname = id => {
     const p = contacts[id];
@@ -900,10 +907,12 @@ function lucasStats(d) {
   const byOutcome = o => thisWeekMtgs.filter(m => m.properties.hs_meeting_outcome === o).map(mrow).sort((a, b) => a.ts - b.ts);
 
   const completedRows = byOutcome('COMPLETED');
-  const closesRows = completedRows.filter(r => {
-    const p = r.cid && contacts[r.cid];
-    return p && p.user_status === 'paid_customer';
-  }).map(r => ({ ...r, status: 'paying customer' }));
+  const closesRows = closedOnCall.map(c => {
+    const p = c.properties;
+    const ts = Number(new Date(p.became_paid_customer_date));
+    return { cid: c.id, name: [p.firstname, p.lastname].filter(Boolean).join(' ') || p.email,
+             when: fmtT(p.became_paid_customer_date), status: 'paid same day as demo', ts };
+  }).sort((a, b) => b.ts - a.ts);
 
   const actRows = sales.map(c => {
     const p = c.properties;
@@ -931,6 +940,8 @@ function lucasStats(d) {
     upcoming: thisWeekMtgs.filter(m => ['SCHEDULED', null, undefined, ''].includes(m.properties.hs_meeting_outcome)).length,
     upcomingRows: thisWeekMtgs.filter(m => ['SCHEDULED', null, undefined, ''].includes(m.properties.hs_meeting_outcome)).map(mrow).sort((a, b) => a.ts - b.ts),
     closes: closesRows.length, closesRows,
+    closesToday: closesRows.filter(r => r.ts >= dayStart).length,
+    closesRowsToday: closesRows.filter(r => r.ts >= dayStart),
     actWeek: actRows.length, actToday: actRows.filter(r => r.wonTs >= dayStart).length,
     actMrr: actRows.reduce((t, r) => t + r.amount, 0), actRows,
     actRowsToday: actRows.filter(r => r.wonTs >= dayStart),
@@ -976,8 +987,10 @@ function renderLucas(s) {
     canceled: mtgTable(s.canceledRows),
     resched: mtgTable(s.rescheduledRows),
     upcoming: mtgTable(s.upcomingRows),
-    closes: s.closesRows.length ? `<table><thead><tr><th>Who</th><th>Meeting</th><th>Status</th></tr></thead><tbody>${
+    closes: s.closesRows.length ? `<table><thead><tr><th>Who</th><th>Became Paying</th><th>Note</th></tr></thead><tbody>${
       s.closesRows.map(r => `<tr><td>${link(r.cid, r.name)}</td><td>${r.when}</td><td>${r.status}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>',
+    closestoday: s.closesRowsToday.length ? `<table><thead><tr><th>Who</th><th>Became Paying</th></tr></thead><tbody>${
+      s.closesRowsToday.map(r => `<tr><td>${link(r.cid, r.name)}</td><td>${r.when}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None today.</p>',
     acts: salesTable(s.actRows),
   };
   const tile = (big, lbl, sub, key) => `<div class="tile${key ? ' click' : ''}"${key ? ` onclick="show('${key}', this)"` : ''}><div class="big">${big}</div><div class="lbl">${lbl}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
@@ -1018,6 +1031,7 @@ function renderLucas(s) {
     ${tile(s.dials.today, 'Dials', '', 'dialstoday')}
     ${tile(s.unique.today, 'Unique Dials', '', 'dialstoday')}
     ${tile(s.booked.today, 'Demos Booked', 'via scheduler', 'bookedtoday')}
+    ${tile(s.closesToday, 'Closed on Call', 'paid same day as demo', 'closestoday')}
     ${tile(s.actToday, 'Sales Made', 'new paying customers', 'actstoday')}
   </div>
   <h2>This Week (Mon to now)</h2>
@@ -1026,7 +1040,7 @@ function renderLucas(s) {
     ${tile(s.unique.week, 'Unique Dials', '', 'dials')}
     ${tile(s.booked.week, 'Demos Booked', 'via scheduler', 'booked')}
     ${tile(s.completed, 'Demos Completed', '', 'completed')}
-    ${tile(s.closes, 'Closed on Demo', 'completed + activated', 'closes')}
+    ${tile(s.closes, 'Closed on Call', 'paid same day as demo', 'closes')}
     ${tile(s.actWeek, 'Sales Made', '$' + Math.round(s.actMrr) + '/mo added', 'acts')}
   </div>
   <h2>Meeting Outcomes This Week</h2>
@@ -1040,7 +1054,7 @@ function renderLucas(s) {
   <p class="foot">
     Dials = outbound calls owned by Lucas. Unique = distinct numbers dialed; the dials panel shows attempts per person.
     Demos Booked = meetings created via the scheduling page this week. Outcome tiles cover meetings taking place this week; set the outcome on each meeting to keep these true.
-    Closed on Demo = contacts from this week's completed meetings who are now paying customers. Sales Made = contacts whose status flipped to paying customer in the window (exact timestamps from status history), any source.
+    Closed on Call = became a paying customer the same Melbourne day as a completed demo with Lucas (the closed_on_call property, identical to the HubSpot report). Sales Made = contacts whose status flipped to paying customer in the window (exact timestamps from status history), any source.
     Names link to the HubSpot record. Data refreshes every 5 minutes.
   </p>
 </div>
