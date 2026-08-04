@@ -774,12 +774,198 @@ function renderHTML(data, error) {
 </html>`;
 }
 
+
+// ---------- Lucas scorecard (/lucas) ----------
+const LUCAS_ID = '86929887';
+
+function melBounds() {
+  // Melbourne day/week boundaries in epoch ms, DST-safe
+  const now = new Date();
+  const melStr = now.toLocaleString('sv', { timeZone: 'Australia/Melbourne' }); // YYYY-MM-DD HH:mm:ss
+  const ymd = melStr.slice(0, 10);
+  const offsetMs = Date.parse(melStr.replace(' ', 'T') + 'Z') - now.getTime();
+  const dayStart = Date.parse(ymd + 'T00:00:00Z') - offsetMs;
+  const dow = new Date(ymd + 'T00:00:00Z').getUTCDay() || 7; // Mon=1..Sun=7
+  const weekStart = dayStart - (dow - 1) * 86400000;
+  return { dayStart, weekStart };
+}
+
+async function searchAll(object, filters, properties) {
+  const out = [];
+  let after;
+  while (true) {
+    const body = { filterGroups: [{ filters }], properties, limit: 100 };
+    if (after) body.after = after;
+    const { data } = await withRetry(() => api.post(`/crm/v3/objects/${object}/search`, body));
+    out.push(...data.results);
+    if (!data.paging?.next?.after) break;
+    after = data.paging.next.after;
+    await sleep(250);
+  }
+  return out;
+}
+
+async function fetchLucasData() {
+  const { dayStart, weekStart } = melBounds();
+  const wk = String(weekStart);
+
+  const calls = await searchAll('calls', [
+    { propertyName: 'hubspot_owner_id', operator: 'EQ', value: LUCAS_ID },
+    { propertyName: 'hs_timestamp', operator: 'GTE', value: wk },
+    { propertyName: 'hs_call_direction', operator: 'EQ', value: 'OUTBOUND' },
+  ], ['hs_timestamp', 'hs_call_to_number']);
+
+  const meetingProps = ['hs_meeting_outcome', 'hs_meeting_source', 'hs_createdate', 'hs_timestamp'];
+  const booked = await searchAll('meetings', [
+    { propertyName: 'hubspot_owner_id', operator: 'EQ', value: LUCAS_ID },
+    { propertyName: 'hs_createdate', operator: 'GTE', value: wk },
+  ], meetingProps);
+  const happening = await searchAll('meetings', [
+    { propertyName: 'hubspot_owner_id', operator: 'EQ', value: LUCAS_ID },
+    { propertyName: 'hs_timestamp', operator: 'GTE', value: wk },
+  ], meetingProps);
+  const meetings = {};
+  for (const m of [...booked, ...happening]) meetings[m.id] = m;
+
+  // closes on demo: contacts of this week's completed meetings with an activation
+  const completedIds = Object.values(meetings)
+    .filter(m => m.properties.hs_meeting_outcome === 'COMPLETED' && Number(new Date(m.properties.hs_timestamp)) >= weekStart)
+    .map(m => m.id);
+  let closes = 0;
+  if (completedIds.length) {
+    const cids = new Set();
+    for (let i = 0; i < completedIds.length; i += 100) {
+      const { data } = await withRetry(() => api.post('/crm/v4/associations/meetings/contacts/batch/read',
+        { inputs: completedIds.slice(i, i + 100).map(id => ({ id })) }));
+      for (const r of data.results || []) for (const t of r.to || []) cids.add(String(t.toObjectId));
+    }
+    const arr = [...cids];
+    for (let i = 0; i < arr.length; i += 100) {
+      const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read',
+        { inputs: arr.slice(i, i + 100).map(id => ({ id })), properties: ['user_status', 'sammy_trial_start_date'] }));
+      closes += (data.results || []).filter(r => r.properties.sammy_trial_start_date || r.properties.user_status).length;
+    }
+  }
+
+  const actWeek = (await withRetry(() => api.post('/crm/v3/objects/contacts/search',
+    { filterGroups: [{ filters: [{ propertyName: 'sammy_trial_start_date', operator: 'GTE', value: wk }] }], limit: 1 }))).data.total;
+  const actToday = (await withRetry(() => api.post('/crm/v3/objects/contacts/search',
+    { filterGroups: [{ filters: [{ propertyName: 'sammy_trial_start_date', operator: 'GTE', value: String(dayStart) }] }], limit: 1 }))).data.total;
+
+  return { calls, meetings: Object.values(meetings), closes, actWeek, actToday, dayStart, weekStart, fetchedAt: new Date().toISOString() };
+}
+
+function lucasStats(d) {
+  const { calls, meetings, dayStart, weekStart } = d;
+  const inDay = ts => Number(new Date(ts)) >= dayStart;
+  const dials = { week: calls.length, today: calls.filter(c => inDay(c.properties.hs_timestamp)).length };
+  const uniq = arr => new Set(arr.map(c => c.properties.hs_call_to_number).filter(Boolean)).size;
+  const unique = { week: uniq(calls), today: uniq(calls.filter(c => inDay(c.properties.hs_timestamp))) };
+
+  const sched = meetings.filter(m => m.properties.hs_meeting_source === 'MEETINGS_PUBLIC');
+  const bookedWeek = sched.filter(m => Number(new Date(m.properties.hs_createdate)) >= weekStart);
+  const bookedToday = bookedWeek.filter(m => Number(new Date(m.properties.hs_createdate)) >= dayStart);
+  const thisWeekMtgs = meetings.filter(m => Number(new Date(m.properties.hs_timestamp)) >= weekStart);
+  const byOutcome = o => thisWeekMtgs.filter(m => m.properties.hs_meeting_outcome === o).length;
+
+  return {
+    dials, unique,
+    booked: { week: bookedWeek.length, today: bookedToday.length },
+    completed: byOutcome('COMPLETED'), noShow: byOutcome('NO_SHOW'),
+    canceled: byOutcome('CANCELED'), rescheduled: byOutcome('RESCHEDULED'),
+    upcoming: thisWeekMtgs.filter(m => ['SCHEDULED', null, undefined, ''].includes(m.properties.hs_meeting_outcome)).length,
+    closes: d.closes, actWeek: d.actWeek, actToday: d.actToday,
+  };
+}
+
+let lucasCache = { data: null, time: 0, loading: null };
+async function getLucas(force = false) {
+  if (!force && lucasCache.data && Date.now() - lucasCache.time < CACHE_TTL_MS) return lucasCache.data;
+  if (lucasCache.loading) return lucasCache.loading;
+  lucasCache.loading = (async () => {
+    try {
+      const raw = await fetchLucasData();
+      lucasCache.data = { ...lucasStats(raw), fetchedAt: raw.fetchedAt };
+      lucasCache.time = Date.now();
+      return lucasCache.data;
+    } catch (err) {
+      console.error('[lucas] fetch failed:', err.response?.status || err.message);
+      return lucasCache.data;
+    } finally { lucasCache.loading = null; }
+  })();
+  return lucasCache.loading;
+}
+
+function renderLucas(s) {
+  if (!s) return `<!doctype html><html><body><p>Loading...</p><script>setTimeout(()=>location.reload(),3000)</script></body></html>`;
+  const tile = (big, lbl, sub) => `<div class="tile"><div class="big">${big}</div><div class="lbl">${lbl}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lucas Scorecard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#fafafa;color:#1a1a1a;padding:32px 16px}
+  .container{max-width:900px;margin:0 auto}
+  h1{font-size:24px;font-weight:700;letter-spacing:-0.5px}
+  .meta{color:#888;font-size:13px;margin:4px 0 20px}
+  .meta a{color:#0066cc;text-decoration:none}
+  h2{font-size:15px;font-weight:600;margin:22px 0 8px;color:#444}
+  .wk{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .tile{background:#fff;border:1px solid #eee;border-radius:10px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,0.03)}
+  .big{font-size:26px;font-weight:700;letter-spacing:-0.5px}
+  .lbl{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}
+  .sub{font-size:11px;color:#aaa;margin-top:4px}
+  .foot{color:#999;font-size:12px;margin-top:22px;line-height:1.6}
+</style></head><body><div class="container">
+  <h1>Lucas Scorecard</h1>
+  <p class="meta">Updated ${fmtAge(s.fetchedAt)} &middot; Melbourne time &middot; <a href="/lucas?force=1">refresh</a> &middot; <a href="/">attribution dashboard</a></p>
+  <h2>Today</h2>
+  <div class="wk">
+    ${tile(s.dials.today, 'Dials', '')}
+    ${tile(s.unique.today, 'Unique Dials', '')}
+    ${tile(s.booked.today, 'Demos Booked', 'via scheduler')}
+    ${tile(s.actToday, 'Activations', 'trial starts, all sources')}
+  </div>
+  <h2>This Week (Mon to now)</h2>
+  <div class="wk">
+    ${tile(s.dials.week, 'Dials', '')}
+    ${tile(s.unique.week, 'Unique Dials', '')}
+    ${tile(s.booked.week, 'Demos Booked', 'via scheduler')}
+    ${tile(s.completed, 'Demos Completed', '')}
+    ${tile(s.closes, 'Closed on Demo', 'completed + activated')}
+    ${tile(s.actWeek, 'Activations', 'trial starts, all sources')}
+  </div>
+  <h2>Meeting Outcomes This Week</h2>
+  <div class="wk">
+    ${tile(s.noShow, 'No Shows', '')}
+    ${tile(s.canceled, 'Canceled', '')}
+    ${tile(s.rescheduled, 'Rescheduled', '')}
+    ${tile(s.upcoming, 'Upcoming / Unmarked', 'outcome not set yet')}
+  </div>
+  <p class="foot">
+    Dials = outbound calls owned by Lucas (call credit healing keeps ownership accurate). Unique = distinct numbers dialed.
+    Demos Booked = meetings created via the scheduling page this week. Outcome tiles cover meetings taking place this week; set the outcome on each meeting to keep these true.
+    Closed on Demo = contacts from this week's completed meetings who have a Sammy activation. Activations = contacts whose trial started in the window, any source.
+    Data refreshes every 5 minutes.
+  </p>
+</div></body></html>`;
+}
+
 const app = express();
 app.get('/health', (req, res) => res.send('ok'));
 app.get('/api/data', async (req, res) => {
   const data = await getData(req.query.force === '1');
   if (!data) return res.status(503).json({ status: 'loading', error: cache.error });
   res.json(data);
+});
+app.get('/api/lucas', async (req, res) => {
+  const d = await getLucas(req.query.force === '1');
+  if (!d) return res.status(503).json({ status: 'loading' });
+  res.json(d);
+});
+app.get('/lucas', async (req, res) => {
+  const d = await getLucas(req.query.force === '1');
+  res.type('html').send(renderLucas(d));
 });
 app.get('/', async (req, res) => {
   const data = await getData(req.query.force === '1');
