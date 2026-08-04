@@ -785,8 +785,9 @@ function melBounds() {
   const ymd = melStr.slice(0, 10);
   const offsetMs = Date.parse(melStr.replace(' ', 'T') + 'Z') - now.getTime();
   const dayStart = Date.parse(ymd + 'T00:00:00Z') - offsetMs;
-  const dow = new Date(ymd + 'T00:00:00Z').getUTCDay() || 7; // Mon=1..Sun=7
-  const weekStart = dayStart - (dow - 1) * 86400000;
+  // Week starts SUNDAY to match HubSpot's reporting weeks (source of truth)
+  const dow = new Date(ymd + 'T00:00:00Z').getUTCDay(); // Sun=0..Sat=6
+  const weekStart = dayStart - dow * 86400000;
   return { dayStart, weekStart };
 }
 
@@ -1034,7 +1035,7 @@ function renderLucas(s) {
     ${tile(s.closesToday, 'Closed on Call', 'paid same day as demo', 'closestoday')}
     ${tile(s.actToday, 'Sales Made', 'new paying customers', 'actstoday')}
   </div>
-  <h2>This Week (Mon to now)</h2>
+  <h2>This Week (Sun to now, HubSpot weeks)</h2>
   <div class="wk">
     ${tile(s.dials.week, 'Dials', '', 'dials')}
     ${tile(s.unique.week, 'Unique Dials', '', 'dials')}
