@@ -816,7 +816,7 @@ async function fetchLucasData() {
     { propertyName: 'hs_call_direction', operator: 'EQ', value: 'OUTBOUND' },
   ], ['hs_timestamp', 'hs_call_to_number']);
 
-  const meetingProps = ['hs_meeting_outcome', 'hs_meeting_source', 'hs_createdate', 'hs_timestamp', 'hs_meeting_title'];
+  const meetingProps = ['hs_meeting_outcome', 'hs_meeting_source', 'hs_createdate', 'hs_timestamp', 'hs_meeting_title', 'is_demo'];
   const booked = await searchAll('meetings', [
     { propertyName: 'hubspot_owner_id', operator: 'EQ', value: LUCAS_ID },
     { propertyName: 'hs_createdate', operator: 'GTE', value: wk },
@@ -901,7 +901,9 @@ function lucasStats(d) {
   const mrow = m => ({ id: m.id, cid: mtgContact[m.id] || null, name: mtgContact[m.id] ? cname(mtgContact[m.id]) : (m.properties.hs_meeting_title || 'meeting'),
                        when: fmtT(m.properties.hs_timestamp), bookedAt: fmtT(m.properties.hs_createdate), ts: Number(new Date(m.properties.hs_timestamp)) });
 
-  const sched = meetings.filter(m => m.properties.hs_meeting_source === 'MEETINGS_PUBLIC');
+  // demo definition: is_demo property (canonical), with source as fallback for
+  // bookings newer than the hourly stamper's last pass
+  const sched = meetings.filter(m => m.properties.is_demo === 'true' || m.properties.hs_meeting_source === 'MEETINGS_PUBLIC');
   const bookedWeek = sched.filter(m => Number(new Date(m.properties.hs_createdate)) >= weekStart);
   const bookedToday = bookedWeek.filter(m => Number(new Date(m.properties.hs_createdate)) >= dayStart);
   const thisWeekMtgs = meetings.filter(m => Number(new Date(m.properties.hs_timestamp)) >= weekStart);
