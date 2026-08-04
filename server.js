@@ -853,26 +853,19 @@ async function fetchLucasData() {
     await sleep(150);
   }
 
-  // sales made = deals entering the won stage (moved automatically when a
-  // contact becomes a paying customer)
-  const wonDeals = await searchAll('deals', [
-    { propertyName: 'hs_v2_date_entered_decisionmakerboughtin', operator: 'GTE', value: wk },
-  ], ['dealname', 'amount', 'hs_v2_date_entered_decisionmakerboughtin']);
-  const dealContact = await assocMap('deals', wonDeals.map(d => d.id));
-  const dcids = [...new Set(Object.values(dealContact))].filter(id => !contacts[id]);
-  for (let i = 0; i < dcids.length; i += 100) {
-    const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read',
-      { inputs: dcids.slice(i, i + 100).map(id => ({ id })), properties: ['firstname', 'lastname', 'email', 'user_status', 'sammy_pricing_plan'] }));
-    for (const r of data.results || []) contacts[r.id] = r.properties;
-    await sleep(150);
-  }
+  // sales made = contacts whose became_paid_customer_date falls in the window.
+  // Contact object is the source of truth (deals are moved downstream by a
+  // workflow and can lag or miss associations).
+  const sales = await searchAll('contacts', [
+    { propertyName: 'became_paid_customer_date', operator: 'GTE', value: wk },
+  ], ['firstname', 'lastname', 'email', 'became_paid_customer_date', 'sammy_pricing_plan', 'sammy_promo_code']);
 
-  return { calls, meetings: Object.values(meetings), callContact, mtgContact, contacts, wonDeals, dealContact,
+  return { calls, meetings: Object.values(meetings), callContact, mtgContact, contacts, sales,
            dayStart, weekStart, fetchedAt: new Date().toISOString() };
 }
 
 function lucasStats(d) {
-  const { calls, meetings, callContact, mtgContact, contacts, wonDeals, dealContact, dayStart, weekStart } = d;
+  const { calls, meetings, callContact, mtgContact, contacts, sales, dayStart, weekStart } = d;
   const inDay = ts => Number(new Date(ts)) >= dayStart;
   const cname = id => {
     const p = contacts[id];
@@ -912,19 +905,23 @@ function lucasStats(d) {
     return p && p.user_status === 'paid_customer';
   }).map(r => ({ ...r, status: 'paying customer' }));
 
-  const actRows = wonDeals.map(d => {
-    const cid = dealContact[d.id] || null;
-    const wonTs = Number(new Date(d.properties.hs_v2_date_entered_decisionmakerboughtin));
+  const actRows = sales.map(c => {
+    const p = c.properties;
+    const wonTs = Number(new Date(p.became_paid_customer_date));
+    let amount = PLAN_PRICING[p.sammy_pricing_plan] ?? PLAN_PRICING.default;
+    if (p.sammy_promo_code === 'qRlQX1PO') amount = Math.max(amount - 10, 0);
     return {
-      id: cid, name: cid ? cname(cid) : (d.properties.dealname || 'deal'),
-      amount: parseFloat(d.properties.amount) || 0,
+      id: c.id, name: [p.firstname, p.lastname].filter(Boolean).join(' ') || p.email,
+      amount,
       date: new Date(wonTs).toLocaleDateString('en-AU', { timeZone: 'Australia/Melbourne', day: 'numeric', month: 'short' }),
       wonTs,
     };
   }).sort((a, b) => b.wonTs - a.wonTs);
 
+  const dialsDetailToday = dialsDetail.filter(e => e.today > 0);
+  const bookedRowsToday = bookedWeek.filter(m => Number(new Date(m.properties.hs_createdate)) >= dayStart).map(mrow);
   return {
-    dials, unique, dialsDetail,
+    dials, unique, dialsDetail, dialsDetailToday, bookedRowsToday,
     booked: { week: bookedWeek.length, today: bookedToday.length },
     bookedRows: bookedWeek.map(mrow).sort((a, b) => a.ts - b.ts),
     completed: completedRows.length, completedRows,
@@ -936,6 +933,7 @@ function lucasStats(d) {
     closes: closesRows.length, closesRows,
     actWeek: actRows.length, actToday: actRows.filter(r => r.wonTs >= dayStart).length,
     actMrr: actRows.reduce((t, r) => t + r.amount, 0), actRows,
+    actRowsToday: actRows.filter(r => r.wonTs >= dayStart),
   };
 }
 
@@ -963,9 +961,15 @@ function renderLucas(s) {
   const link = (cid, name) => cid ? `<a href="${HS}${cid}" target="_blank">${name || 'contact'}</a>` : (name || '');
   const mtgTable = rows => rows.length ? `<table><thead><tr><th>Who</th><th>Meeting Time</th><th>Booked</th></tr></thead><tbody>${
     rows.map(r => `<tr><td>${link(r.cid, r.name)}</td><td>${r.when}</td><td>${r.bookedAt}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>';
+  const dialTable = rows => rows.length ? `<table><thead><tr><th>Who / Number</th><th>Attempts (wk)</th><th>Today</th></tr></thead><tbody>${
+      rows.map(e => `<tr><td>${link(e.cid, e.name)} <span class="mut">${e.number}</span></td><td>${e.count}</td><td>${e.today || ''}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None today.</p>';
+  const salesTable = rows => rows.length ? `<table><thead><tr><th>Who</th><th>Became Paying</th><th>$/mo</th></tr></thead><tbody>${
+      rows.map(r => `<tr><td>${link(r.id, r.name)}</td><td>${r.date}</td><td>${r.amount ? '$' + r.amount : ''}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None in this window yet.</p>';
   const details = {
-    dials: `<table><thead><tr><th>Who / Number</th><th>Attempts (wk)</th><th>Today</th></tr></thead><tbody>${
-      s.dialsDetail.map(e => `<tr><td>${link(e.cid, e.name)} <span class="mut">${e.number}</span></td><td>${e.count}</td><td>${e.today || ''}</td></tr>`).join('')}</tbody></table>`,
+    dials: dialTable(s.dialsDetail),
+    dialstoday: dialTable(s.dialsDetailToday),
+    bookedtoday: mtgTable(s.bookedRowsToday),
+    actstoday: salesTable(s.actRowsToday),
     booked: mtgTable(s.bookedRows),
     completed: mtgTable(s.completedRows),
     noshow: mtgTable(s.noShowRows),
@@ -974,8 +978,7 @@ function renderLucas(s) {
     upcoming: mtgTable(s.upcomingRows),
     closes: s.closesRows.length ? `<table><thead><tr><th>Who</th><th>Meeting</th><th>Status</th></tr></thead><tbody>${
       s.closesRows.map(r => `<tr><td>${link(r.cid, r.name)}</td><td>${r.when}</td><td>${r.status}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>',
-    acts: s.actRows.length ? `<table><thead><tr><th>Who</th><th>Became Paying</th><th>$/mo</th></tr></thead><tbody>${
-      s.actRows.map(r => `<tr><td>${link(r.id, r.name)}</td><td>${r.date}</td><td>${r.amount ? '$' + r.amount : ''}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>',
+    acts: salesTable(s.actRows),
   };
   const tile = (big, lbl, sub, key) => `<div class="tile${key ? ' click' : ''}"${key ? ` onclick="show('${key}', this)"` : ''}><div class="big">${big}</div><div class="lbl">${lbl}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
   return `<!doctype html>
@@ -1012,10 +1015,10 @@ function renderLucas(s) {
   <p class="meta">Updated ${fmtAge(s.fetchedAt)} &middot; Melbourne time &middot; click any tile to see the records behind it &middot; <a href="/lucas?force=1">refresh</a> &middot; <a href="/">attribution dashboard</a></p>
   <h2>Today</h2>
   <div class="wk">
-    ${tile(s.dials.today, 'Dials', '', 'dials')}
-    ${tile(s.unique.today, 'Unique Dials', '', 'dials')}
-    ${tile(s.booked.today, 'Demos Booked', 'via scheduler', 'booked')}
-    ${tile(s.actToday, 'Sales Made', 'new paying customers', 'acts')}
+    ${tile(s.dials.today, 'Dials', '', 'dialstoday')}
+    ${tile(s.unique.today, 'Unique Dials', '', 'dialstoday')}
+    ${tile(s.booked.today, 'Demos Booked', 'via scheduler', 'bookedtoday')}
+    ${tile(s.actToday, 'Sales Made', 'new paying customers', 'actstoday')}
   </div>
   <h2>This Week (Mon to now)</h2>
   <div class="wk">
@@ -1037,7 +1040,7 @@ function renderLucas(s) {
   <p class="foot">
     Dials = outbound calls owned by Lucas. Unique = distinct numbers dialed; the dials panel shows attempts per person.
     Demos Booked = meetings created via the scheduling page this week. Outcome tiles cover meetings taking place this week; set the outcome on each meeting to keep these true.
-    Closed on Demo = contacts from this week's completed meetings who are now paying customers. Sales Made = deals reaching the won stage this week (moved automatically when a customer starts paying), any source.
+    Closed on Demo = contacts from this week's completed meetings who are now paying customers. Sales Made = contacts whose status flipped to paying customer in the window (exact timestamps from status history), any source.
     Names link to the HubSpot record. Data refreshes every 5 minutes.
   </p>
 </div>
