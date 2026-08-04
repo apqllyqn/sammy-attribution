@@ -815,7 +815,7 @@ async function fetchLucasData() {
     { propertyName: 'hs_call_direction', operator: 'EQ', value: 'OUTBOUND' },
   ], ['hs_timestamp', 'hs_call_to_number']);
 
-  const meetingProps = ['hs_meeting_outcome', 'hs_meeting_source', 'hs_createdate', 'hs_timestamp'];
+  const meetingProps = ['hs_meeting_outcome', 'hs_meeting_source', 'hs_createdate', 'hs_timestamp', 'hs_meeting_title'];
   const booked = await searchAll('meetings', [
     { propertyName: 'hubspot_owner_id', operator: 'EQ', value: LUCAS_ID },
     { propertyName: 'hs_createdate', operator: 'GTE', value: wk },
@@ -827,54 +827,99 @@ async function fetchLucasData() {
   const meetings = {};
   for (const m of [...booked, ...happening]) meetings[m.id] = m;
 
-  // closes on demo: contacts of this week's completed meetings with an activation
-  const completedIds = Object.values(meetings)
-    .filter(m => m.properties.hs_meeting_outcome === 'COMPLETED' && Number(new Date(m.properties.hs_timestamp)) >= weekStart)
-    .map(m => m.id);
-  let closes = 0;
-  if (completedIds.length) {
-    const cids = new Set();
-    for (let i = 0; i < completedIds.length; i += 100) {
-      const { data } = await withRetry(() => api.post('/crm/v4/associations/meetings/contacts/batch/read',
-        { inputs: completedIds.slice(i, i + 100).map(id => ({ id })) }));
-      for (const r of data.results || []) for (const t of r.to || []) cids.add(String(t.toObjectId));
+  // resolve contacts for calls and meetings so drill-downs show names
+  async function assocMap(fromType, ids) {
+    const map = {};
+    for (let i = 0; i < ids.length; i += 100) {
+      const { data } = await withRetry(() => api.post(`/crm/v4/associations/${fromType}/contacts/batch/read`,
+        { inputs: ids.slice(i, i + 100).map(id => ({ id })) }));
+      for (const r of data.results || []) {
+        const to = (r.to || [])[0];
+        if (to) map[String(r.from.id)] = String(to.toObjectId);
+      }
+      await sleep(150);
     }
-    const arr = [...cids];
-    for (let i = 0; i < arr.length; i += 100) {
-      const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read',
-        { inputs: arr.slice(i, i + 100).map(id => ({ id })), properties: ['user_status', 'sammy_trial_start_date'] }));
-      closes += (data.results || []).filter(r => r.properties.sammy_trial_start_date || r.properties.user_status).length;
-    }
+    return map;
+  }
+  const callContact = await assocMap('calls', calls.map(c => c.id));
+  const mtgContact = await assocMap('meetings', Object.keys(meetings));
+
+  const cids = [...new Set([...Object.values(callContact), ...Object.values(mtgContact)])];
+  const contacts = {};
+  for (let i = 0; i < cids.length; i += 100) {
+    const { data } = await withRetry(() => api.post('/crm/v3/objects/contacts/batch/read',
+      { inputs: cids.slice(i, i + 100).map(id => ({ id })), properties: ['firstname', 'lastname', 'email', 'user_status', 'sammy_trial_start_date'] }));
+    for (const r of data.results || []) contacts[r.id] = r.properties;
+    await sleep(150);
   }
 
-  const actWeek = (await withRetry(() => api.post('/crm/v3/objects/contacts/search',
-    { filterGroups: [{ filters: [{ propertyName: 'sammy_trial_start_date', operator: 'GTE', value: wk }] }], limit: 1 }))).data.total;
-  const actToday = (await withRetry(() => api.post('/crm/v3/objects/contacts/search',
-    { filterGroups: [{ filters: [{ propertyName: 'sammy_trial_start_date', operator: 'GTE', value: String(dayStart) }] }], limit: 1 }))).data.total;
+  const activations = await searchAll('contacts', [
+    { propertyName: 'sammy_trial_start_date', operator: 'GTE', value: wk },
+  ], ['firstname', 'lastname', 'email', 'user_status', 'sammy_trial_start_date']);
 
-  return { calls, meetings: Object.values(meetings), closes, actWeek, actToday, dayStart, weekStart, fetchedAt: new Date().toISOString() };
+  return { calls, meetings: Object.values(meetings), callContact, mtgContact, contacts, activations,
+           dayStart, weekStart, fetchedAt: new Date().toISOString() };
 }
 
 function lucasStats(d) {
-  const { calls, meetings, dayStart, weekStart } = d;
+  const { calls, meetings, callContact, mtgContact, contacts, activations, dayStart, weekStart } = d;
   const inDay = ts => Number(new Date(ts)) >= dayStart;
+  const cname = id => {
+    const p = contacts[id];
+    if (!p) return null;
+    return [p.firstname, p.lastname].filter(Boolean).join(' ') || p.email || `contact ${id}`;
+  };
+  const fmtT = ts => new Date(ts).toLocaleString('en-AU', { timeZone: 'Australia/Melbourne', weekday: 'short', hour: 'numeric', minute: '2-digit', day: 'numeric', month: 'short' });
+
+  // dials grouped by number
+  const byNum = {};
+  for (const c of calls) {
+    const n = c.properties.hs_call_to_number || '(no number)';
+    const e = byNum[n] = byNum[n] || { number: n, count: 0, today: 0, cid: null, last: 0 };
+    e.count += 1;
+    if (inDay(c.properties.hs_timestamp)) e.today += 1;
+    e.cid = e.cid || callContact[c.id] || null;
+    e.last = Math.max(e.last, Number(new Date(c.properties.hs_timestamp)));
+  }
+  const dialsDetail = Object.values(byNum).map(e => ({ ...e, name: e.cid ? cname(e.cid) : null }))
+    .sort((a, b) => b.last - a.last);
+
   const dials = { week: calls.length, today: calls.filter(c => inDay(c.properties.hs_timestamp)).length };
-  const uniq = arr => new Set(arr.map(c => c.properties.hs_call_to_number).filter(Boolean)).size;
-  const unique = { week: uniq(calls), today: uniq(calls.filter(c => inDay(c.properties.hs_timestamp))) };
+  const unique = { week: dialsDetail.length, today: dialsDetail.filter(e => e.today > 0).length };
+
+  const mrow = m => ({ id: m.id, cid: mtgContact[m.id] || null, name: mtgContact[m.id] ? cname(mtgContact[m.id]) : (m.properties.hs_meeting_title || 'meeting'),
+                       when: fmtT(m.properties.hs_timestamp), bookedAt: fmtT(m.properties.hs_createdate), ts: Number(new Date(m.properties.hs_timestamp)) });
 
   const sched = meetings.filter(m => m.properties.hs_meeting_source === 'MEETINGS_PUBLIC');
   const bookedWeek = sched.filter(m => Number(new Date(m.properties.hs_createdate)) >= weekStart);
   const bookedToday = bookedWeek.filter(m => Number(new Date(m.properties.hs_createdate)) >= dayStart);
   const thisWeekMtgs = meetings.filter(m => Number(new Date(m.properties.hs_timestamp)) >= weekStart);
-  const byOutcome = o => thisWeekMtgs.filter(m => m.properties.hs_meeting_outcome === o).length;
+  const byOutcome = o => thisWeekMtgs.filter(m => m.properties.hs_meeting_outcome === o).map(mrow).sort((a, b) => a.ts - b.ts);
+
+  const completedRows = byOutcome('COMPLETED');
+  const closesRows = completedRows.filter(r => {
+    const p = r.cid && contacts[r.cid];
+    return p && (p.sammy_trial_start_date || p.user_status);
+  }).map(r => ({ ...r, status: contacts[r.cid].user_status || 'trial started' }));
+
+  const actRows = activations.map(c => ({
+    id: c.id, name: [c.properties.firstname, c.properties.lastname].filter(Boolean).join(' ') || c.properties.email,
+    status: c.properties.user_status || '', date: c.properties.sammy_trial_start_date,
+  })).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  const todayYmd = new Date(dayStart).toLocaleDateString('en-CA', { timeZone: 'Australia/Melbourne' });
 
   return {
-    dials, unique,
+    dials, unique, dialsDetail,
     booked: { week: bookedWeek.length, today: bookedToday.length },
-    completed: byOutcome('COMPLETED'), noShow: byOutcome('NO_SHOW'),
-    canceled: byOutcome('CANCELED'), rescheduled: byOutcome('RESCHEDULED'),
+    bookedRows: bookedWeek.map(mrow).sort((a, b) => a.ts - b.ts),
+    completed: completedRows.length, completedRows,
+    noShow: byOutcome('NO_SHOW').length, noShowRows: byOutcome('NO_SHOW'),
+    canceled: byOutcome('CANCELED').length, canceledRows: byOutcome('CANCELED'),
+    rescheduled: byOutcome('RESCHEDULED').length, rescheduledRows: byOutcome('RESCHEDULED'),
     upcoming: thisWeekMtgs.filter(m => ['SCHEDULED', null, undefined, ''].includes(m.properties.hs_meeting_outcome)).length,
-    closes: d.closes, actWeek: d.actWeek, actToday: d.actToday,
+    upcomingRows: thisWeekMtgs.filter(m => ['SCHEDULED', null, undefined, ''].includes(m.properties.hs_meeting_outcome)).map(mrow).sort((a, b) => a.ts - b.ts),
+    closes: closesRows.length, closesRows,
+    actWeek: actRows.length, actToday: actRows.filter(r => r.date === todayYmd).length, actRows,
   };
 }
 
@@ -898,7 +943,25 @@ async function getLucas(force = false) {
 
 function renderLucas(s) {
   if (!s) return `<!doctype html><html><body><p>Loading...</p><script>setTimeout(()=>location.reload(),3000)</script></body></html>`;
-  const tile = (big, lbl, sub) => `<div class="tile"><div class="big">${big}</div><div class="lbl">${lbl}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
+  const HS = 'https://app-na2.hubspot.com/contacts/244038625/record/0-1/';
+  const link = (cid, name) => cid ? `<a href="${HS}${cid}" target="_blank">${name || 'contact'}</a>` : (name || '');
+  const mtgTable = rows => rows.length ? `<table><thead><tr><th>Who</th><th>Meeting Time</th><th>Booked</th></tr></thead><tbody>${
+    rows.map(r => `<tr><td>${link(r.cid, r.name)}</td><td>${r.when}</td><td>${r.bookedAt}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>';
+  const details = {
+    dials: `<table><thead><tr><th>Who / Number</th><th>Attempts (wk)</th><th>Today</th></tr></thead><tbody>${
+      s.dialsDetail.map(e => `<tr><td>${link(e.cid, e.name)} <span class="mut">${e.number}</span></td><td>${e.count}</td><td>${e.today || ''}</td></tr>`).join('')}</tbody></table>`,
+    booked: mtgTable(s.bookedRows),
+    completed: mtgTable(s.completedRows),
+    noshow: mtgTable(s.noShowRows),
+    canceled: mtgTable(s.canceledRows),
+    resched: mtgTable(s.rescheduledRows),
+    upcoming: mtgTable(s.upcomingRows),
+    closes: s.closesRows.length ? `<table><thead><tr><th>Who</th><th>Meeting</th><th>Status</th></tr></thead><tbody>${
+      s.closesRows.map(r => `<tr><td>${link(r.cid, r.name)}</td><td>${r.when}</td><td>${r.status}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>',
+    acts: s.actRows.length ? `<table><thead><tr><th>Who</th><th>Trial Started</th><th>Status Now</th></tr></thead><tbody>${
+      s.actRows.map(r => `<tr><td>${link(r.id, r.name)}</td><td>${r.date}</td><td>${r.status}</td></tr>`).join('')}</tbody></table>` : '<p class="none">None yet this week.</p>',
+  };
+  const tile = (big, lbl, sub, key) => `<div class="tile${key ? ' click' : ''}"${key ? ` onclick="show('${key}', this)"` : ''}><div class="big">${big}</div><div class="lbl">${lbl}</div>${sub ? `<div class="sub">${sub}</div>` : ''}</div>`;
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lucas Scorecard</title>
@@ -912,43 +975,67 @@ function renderLucas(s) {
   h2{font-size:15px;font-weight:600;margin:22px 0 8px;color:#444}
   .wk{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
   .tile{background:#fff;border:1px solid #eee;border-radius:10px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,0.03)}
+  .tile.click{cursor:pointer}
+  .tile.click:hover{border-color:#bbb}
+  .tile.active{border-color:#0066cc;box-shadow:0 0 0 1px #0066cc}
   .big{font-size:26px;font-weight:700;letter-spacing:-0.5px}
   .lbl{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}
   .sub{font-size:11px;color:#aaa;margin-top:4px}
+  .panel{display:none;background:#fff;border:1px solid #eee;border-radius:10px;margin-top:12px;padding:6px 0;overflow-x:auto}
+  .panel.open{display:block}
+  .panel table{width:100%;border-collapse:collapse;font-size:13px}
+  .panel th{text-align:left;padding:8px 14px;color:#888;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid #f0f0f0}
+  .panel td{padding:8px 14px;border-bottom:1px solid #f7f7f7}
+  .panel tr:last-child td{border-bottom:none}
+  .panel a{color:#0066cc;text-decoration:none}
+  .panel .none{padding:12px 14px;color:#999;font-size:13px}
+  .mut{color:#aaa;font-size:11px;margin-left:6px}
   .foot{color:#999;font-size:12px;margin-top:22px;line-height:1.6}
 </style></head><body><div class="container">
   <h1>Lucas Scorecard</h1>
-  <p class="meta">Updated ${fmtAge(s.fetchedAt)} &middot; Melbourne time &middot; <a href="/lucas?force=1">refresh</a> &middot; <a href="/">attribution dashboard</a></p>
+  <p class="meta">Updated ${fmtAge(s.fetchedAt)} &middot; Melbourne time &middot; click any tile to see the records behind it &middot; <a href="/lucas?force=1">refresh</a> &middot; <a href="/">attribution dashboard</a></p>
   <h2>Today</h2>
   <div class="wk">
-    ${tile(s.dials.today, 'Dials', '')}
-    ${tile(s.unique.today, 'Unique Dials', '')}
-    ${tile(s.booked.today, 'Demos Booked', 'via scheduler')}
-    ${tile(s.actToday, 'Activations', 'trial starts, all sources')}
+    ${tile(s.dials.today, 'Dials', '', 'dials')}
+    ${tile(s.unique.today, 'Unique Dials', '', 'dials')}
+    ${tile(s.booked.today, 'Demos Booked', 'via scheduler', 'booked')}
+    ${tile(s.actToday, 'Activations', 'trial starts, all sources', 'acts')}
   </div>
   <h2>This Week (Mon to now)</h2>
   <div class="wk">
-    ${tile(s.dials.week, 'Dials', '')}
-    ${tile(s.unique.week, 'Unique Dials', '')}
-    ${tile(s.booked.week, 'Demos Booked', 'via scheduler')}
-    ${tile(s.completed, 'Demos Completed', '')}
-    ${tile(s.closes, 'Closed on Demo', 'completed + activated')}
-    ${tile(s.actWeek, 'Activations', 'trial starts, all sources')}
+    ${tile(s.dials.week, 'Dials', '', 'dials')}
+    ${tile(s.unique.week, 'Unique Dials', '', 'dials')}
+    ${tile(s.booked.week, 'Demos Booked', 'via scheduler', 'booked')}
+    ${tile(s.completed, 'Demos Completed', '', 'completed')}
+    ${tile(s.closes, 'Closed on Demo', 'completed + activated', 'closes')}
+    ${tile(s.actWeek, 'Activations', 'trial starts, all sources', 'acts')}
   </div>
   <h2>Meeting Outcomes This Week</h2>
   <div class="wk">
-    ${tile(s.noShow, 'No Shows', '')}
-    ${tile(s.canceled, 'Canceled', '')}
-    ${tile(s.rescheduled, 'Rescheduled', '')}
-    ${tile(s.upcoming, 'Upcoming / Unmarked', 'outcome not set yet')}
+    ${tile(s.noShow, 'No Shows', '', 'noshow')}
+    ${tile(s.canceled, 'Canceled', '', 'canceled')}
+    ${tile(s.rescheduled, 'Rescheduled', '', 'resched')}
+    ${tile(s.upcoming, 'Upcoming / Unmarked', 'outcome not set yet', 'upcoming')}
   </div>
+  ${Object.entries(details).map(([k, html]) => `<div class="panel" id="p-${k}">${html}</div>`).join('')}
   <p class="foot">
-    Dials = outbound calls owned by Lucas (call credit healing keeps ownership accurate). Unique = distinct numbers dialed.
+    Dials = outbound calls owned by Lucas. Unique = distinct numbers dialed; the dials panel shows attempts per person.
     Demos Booked = meetings created via the scheduling page this week. Outcome tiles cover meetings taking place this week; set the outcome on each meeting to keep these true.
-    Closed on Demo = contacts from this week's completed meetings who have a Sammy activation. Activations = contacts whose trial started in the window, any source.
-    Data refreshes every 5 minutes.
+    Closed on Demo = contacts from this week's completed meetings who have a Sammy activation. Activations = contacts whose trial started this week, any source.
+    Names link to the HubSpot record. Data refreshes every 5 minutes.
   </p>
-</div></body></html>`;
+</div>
+<script>
+function show(key, el) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('open'));
+  document.querySelectorAll('.tile').forEach(t => t.classList.remove('active'));
+  const p = document.getElementById('p-' + key);
+  if (el.dataset.open === key) { el.dataset.open = ''; return; }
+  p.classList.add('open'); el.classList.add('active'); el.dataset.open = key;
+  p.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+</script>
+</body></html>`;
 }
 
 const app = express();
