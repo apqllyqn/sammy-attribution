@@ -142,6 +142,25 @@ async function fetchData() {
     fetchEngagementsByContact('meetings'),
   ]);
 
+  // weekly activity metrics for the at-a-glance strip
+  const weekAgoMs = String(Date.now() - 7 * 86400000);
+  const weekly = { calls: 0, meetings: 0, won: 0, wonAmount: 0 };
+  try {
+    const { data: cw } = await withRetry(() => api.post('/crm/v3/objects/calls/search',
+      { filterGroups: [{ filters: [{ propertyName: 'hs_timestamp', operator: 'GTE', value: weekAgoMs }] }], limit: 1 }));
+    weekly.calls = cw.total;
+    const { data: mw } = await withRetry(() => api.post('/crm/v3/objects/meetings/search',
+      { filterGroups: [{ filters: [{ propertyName: 'hs_timestamp', operator: 'GTE', value: weekAgoMs }] }], limit: 1 }));
+    weekly.meetings = mw.total;
+    const { data: ww } = await withRetry(() => api.post('/crm/v3/objects/deals/search',
+      { filterGroups: [{ filters: [{ propertyName: 'hs_v2_date_entered_decisionmakerboughtin', operator: 'GTE', value: weekAgoMs }] }],
+        properties: ['amount'], limit: 100 }));
+    weekly.won = ww.total;
+    weekly.wonAmount = ww.results.reduce((t, r) => t + (parseFloat(r.properties.amount) || 0), 0);
+  } catch (err) {
+    console.error('[weekly] metrics failed:', err.response?.status || err.message);
+  }
+
   const instantly = await fetchInstantly(paidCustomers);
 
   // Leak-junk cohort: ownerless members of HubSpot list 835 (cold-email webhook
@@ -193,7 +212,7 @@ async function fetchData() {
     else if (st === 'churned') b.churned += 1;
   }
 
-  return { paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel, junk, fetchedAt: new Date().toISOString() };
+  return { paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel, junk, weekly, fetchedAt: new Date().toISOString() };
 }
 
 // Closing-channel attribution: which channel actually closed the deal?
@@ -220,7 +239,7 @@ function customerMRR(c) {
   return price;
 }
 
-function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel, junk }) {
+function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, instantly, funnel, junk, weekly }) {
   const init = {};
   const acq = {};
   for (const c of CHANNELS) {
@@ -360,6 +379,16 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
     campaignRows.sort((a, b) => b.mrr - a.mrr || (b.contacted || 0) - (a.contacted || 0));
   }
 
+  // weekly new-lead mix from the recent cohort
+  const wkAgo = Date.now() - 7 * 86400000;
+  const newLeads7 = { total: 0, byChannel: {} };
+  for (const c of recent) {
+    if (new Date(c.properties.createdate).getTime() < wkAgo) continue;
+    newLeads7.total += 1;
+    const ch = c.properties.original_source_channel || 'unknown';
+    newLeads7.byChannel[ch] = (newLeads7.byChannel[ch] || 0) + 1;
+  }
+
   // Data quality: recent contacts arriving without a dialable phone, by source
   const sevenDaysAgo = Date.now() - 7 * 86400000;
   const phonelessSrc = {};
@@ -394,7 +423,7 @@ function aggregate({ paidCustomers, recent, callsByContact, meetingsByContact, i
     .filter(r => r.contacts > 0)
     .sort((a, b) => b.paid - a.paid || b.contacts - a.contacts);
 
-  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded, phonelessRows, phoneless7, phoneless30, recent30: recent.length };
+  return { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded, phonelessRows, phoneless7, phoneless30, recent30: recent.length, weekly, newLeads7 };
 }
 
 let cache = { data: null, time: 0, error: null, loading: null };
@@ -437,7 +466,10 @@ function renderHTML(data, error) {
       <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fafafa;color:#333}</style>
       </head><body><div><p>Loading data from HubSpot…</p>${error ? `<p style="color:#b00">Error: ${error}</p>` : ''}<script>setTimeout(()=>location.reload(),3000)</script></div></body></html>`;
   }
-  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded, phonelessRows, phoneless7, phoneless30, recent30, fetchedAt } = data;
+  const { rows, totals, acqRows, acqTotals, acqUnknown, unknown, crosstab, campaignRows, campaignOther, funnelRows, junkExcluded, phonelessRows, phoneless7, phoneless30, recent30, weekly, newLeads7, fetchedAt } = data;
+  const chShort = { cold_email: 'email', organic_inbound: 'organic', cold_call: 'call', paid_ads: 'ads', user_generated: 'ugc', linkedin_automation: 'li', referral: 'ref', unknown: '?' };
+  const leadMix = Object.entries(newLeads7.byChannel).sort((a, b) => b[1] - a[1]).slice(0, 3)
+    .map(([k, v]) => v + ' ' + (chShort[k] || k)).join(' / ');
   const fmtOriginMix = (mix) => {
     const entries = Object.entries(mix).sort((a, b) => b[1] - a[1]);
     if (entries.length === 0) return '<span class="muted">-</span>';
@@ -583,6 +615,11 @@ function renderHTML(data, error) {
   .meta{color:#888;font-size:13px;margin-bottom:24px}
   .meta .refresh{color:#0066cc;cursor:pointer;text-decoration:none}
   .meta .refresh:hover{text-decoration:underline}
+  .wk{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:14px 0 6px}
+  .wk .tile{background:#fff;border:1px solid #eee;border-radius:10px;padding:12px 14px;box-shadow:0 1px 3px rgba(0,0,0,0.03)}
+  .wk .big{font-size:22px;font-weight:700;letter-spacing:-0.5px}
+  .wk .lbl{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}
+  .wk .sub{font-size:11px;color:#aaa;margin-top:4px}
   .section-title{font-size:16px;font-weight:600;margin:26px 0 2px;letter-spacing:-0.2px}
   .section-sub{color:#888;font-size:12.5px;margin-bottom:10px;line-height:1.5}
   .card{background:#fff;border:1px solid #eee;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.03)}
@@ -616,7 +653,19 @@ function renderHTML(data, error) {
   <h1>Sammy Attribution</h1>
   <p class="meta">Updated ${fmtAge(fetchedAt)} &middot; <a class="refresh" href="/?force=1">refresh now</a></p>
 
+  <h2 class="section-title">This week at a glance</h2>
+  <p class="section-sub">Rolling 7 days, live from HubSpot.</p>
+  <div class="wk">
+    <div class="tile"><div class="big">${weekly.won}</div><div class="lbl">Deals Won</div><div class="sub">${fmtMoney(weekly.wonAmount)}/mo added</div></div>
+    <div class="tile"><div class="big">${newLeads7.total}</div><div class="lbl">New Leads</div><div class="sub">${leadMix || 'none'}</div></div>
+    <div class="tile"><div class="big">${weekly.calls.toLocaleString()}</div><div class="lbl">Calls Made</div><div class="sub">team total</div></div>
+    <div class="tile"><div class="big">${weekly.meetings}</div><div class="lbl">Meetings</div><div class="sub">booked/held</div></div>
+    <div class="tile"><div class="big">${phoneless7}</div><div class="lbl">Phoneless Arrivals</div><div class="sub">see data quality</div></div>
+    <div class="tile"><div class="big">${acqTotals.customers}</div><div class="lbl">Customers Now</div><div class="sub">${fmtMoney(acqTotals.mrr)} MRR</div></div>
+  </div>
+
   <h2 class="section-title">Acquisition (budget view)</h2>
+
   <p class="section-sub">Which channel brought each paying customer in. One row per human: linked accounts count once, credited to the first channel that reached them. Spend decisions read from this table.</p>
   <div class="card">
     <table>
